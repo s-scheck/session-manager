@@ -5,14 +5,14 @@ use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::exit;
 
 use nix::pty::{ForkptyResult, forkpty};
 use nix::sys::signal::Signal;
 use nix::sys::termios::Termios;
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{Pid, execvp};
+use nix::unistd::{Pid, chdir, execvp};
 
 use crate::protocol::{FLAG_LOWPRIORITY, FLAG_READONLY, MAX_PAYLOAD, Packet};
 use crate::pty::{self, Winsize};
@@ -29,6 +29,9 @@ pub struct ServerConfig {
     pub winsize: Winsize,
     /// The attaching client's termios, so the pty starts with matching modes.
     pub termios: Option<Termios>,
+    /// Directory the command should run in (the caller's cwd). The daemon itself
+    /// stays at "/"; only the command chdirs here.
+    pub workdir: Option<PathBuf>,
 }
 
 struct Client {
@@ -60,8 +63,12 @@ pub fn run_server(cfg: ServerConfig, err_pipe: OwnedFd) -> ! {
 
     let (master, child) = match fork {
         ForkptyResult::Child => {
-            // In the pty child: export session env, then exec the command. Any
-            // failure is reported back through the error pipe.
+            // In the pty child: restore the caller's working directory (the
+            // daemon runs at "/"), export session env, then exec the command.
+            // Any failure is reported back through the error pipe.
+            if let Some(dir) = &cfg.workdir {
+                let _ = chdir(dir.as_path());
+            }
             setenv("SM_SESSION", &cfg.session_name);
             setenv("SM_SOCKET", &cfg.socket_path.to_string_lossy());
             let _ = execvp(&cfg.argv[0], &cfg.argv);
@@ -93,6 +100,9 @@ fn event_loop(
     let mut clients: Vec<Client> = Vec::new();
     let listener_fd = listener.as_raw_fd();
     let signal_fd = sigpipe.read_fd();
+    // The active socket path. A Rename packet updates this so status updates and
+    // cleanup on exit follow the renamed file.
+    let mut socket_path = cfg.socket_path.clone();
 
     loop {
         // Build the poll set: signals, listener, pty, then each client.
@@ -117,7 +127,7 @@ fn event_loop(
             if err.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            shutdown(&cfg, &mut clients, child);
+            shutdown(&socket_path, &mut clients, child);
         }
 
         let readable =
@@ -130,7 +140,7 @@ fn event_loop(
                     || sig == Signal::SIGTERM as i32
                     || sig == Signal::SIGINT as i32
                 {
-                    shutdown(&cfg, &mut clients, child);
+                    shutdown(&socket_path, &mut clients, child);
                 }
             }
         }
@@ -139,7 +149,7 @@ fn event_loop(
         if readable(2) {
             let mut buf = [0u8; MAX_PAYLOAD];
             match read_fd(pty_fd, &mut buf) {
-                Ok(0) | Err(_) => shutdown(&cfg, &mut clients, child),
+                Ok(0) | Err(_) => shutdown(&socket_path, &mut clients, child),
                 Ok(n) => {
                     let packet = Packet::Content(buf[..n].to_vec());
                     clients.retain_mut(|c| packet.write_to(&mut c.stream).is_ok());
@@ -155,7 +165,7 @@ fn event_loop(
             if !readable(client_base + idx) {
                 continue;
             }
-            if !handle_client_packet(&cfg, &mut clients, idx, pty_fd) {
+            if !handle_client_packet(&mut socket_path, &mut clients, idx, pty_fd) {
                 disconnected.push(idx);
             }
         }
@@ -174,14 +184,14 @@ fn event_loop(
         }
 
         // Reflect attach state in the socket permission bits.
-        let _ = sockdir::set_socket_state(&cfg.socket_path, !clients.is_empty());
+        let _ = sockdir::set_socket_state(&socket_path, !clients.is_empty());
     }
 }
 
 /// Process one packet from client `idx`. Returns false if the client
 /// disconnected (and should be pruned).
 fn handle_client_packet(
-    cfg: &ServerConfig,
+    socket_path: &mut PathBuf,
     clients: &mut [Client],
     idx: usize,
     pty_fd: RawFd,
@@ -211,11 +221,31 @@ fn handle_client_packet(
             true
         }
         Packet::Detach => false,
-        // Clients never legitimately send Exit/Pid; ignore.
-        Packet::Exit(_) | Packet::Pid(_) => {
-            let _ = cfg;
-            true
+        Packet::Rename(new_name) => {
+            // Rename the socket file within its directory and adopt the new
+            // path so status updates and cleanup follow it. The sender is a
+            // control-only connection, so drop it afterward.
+            rename_socket(socket_path, &new_name);
+            false
         }
+        // Clients never legitimately send Exit/Pid; ignore.
+        Packet::Exit(_) | Packet::Pid(_) => true,
+    }
+}
+
+/// Rename the session's socket to `new_name` within its current directory,
+/// updating `socket_path` on success. Invalid names and failed renames are
+/// ignored (the client detects failure by the new path not appearing).
+fn rename_socket(socket_path: &mut PathBuf, new_name: &str) {
+    if new_name.is_empty() || new_name.contains('/') || new_name.contains('\0') {
+        return;
+    }
+    let Some(parent) = socket_path.parent() else {
+        return;
+    };
+    let new_path = parent.join(new_name);
+    if std::fs::rename(&*socket_path, &new_path).is_ok() {
+        *socket_path = new_path;
     }
 }
 
@@ -246,7 +276,7 @@ fn accept_clients(listener: &UnixListener, clients: &mut Vec<Client>, child: Pid
 
 /// Reap the child, tell every client the exit status, clean up the socket, and
 /// terminate the daemon.
-fn shutdown(cfg: &ServerConfig, clients: &mut [Client], child: Pid) -> ! {
+fn shutdown(socket_path: &Path, clients: &mut [Client], child: Pid) -> ! {
     let status = match waitpid(child, None) {
         Ok(WaitStatus::Exited(_, code)) => code,
         Ok(WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
@@ -256,7 +286,7 @@ fn shutdown(cfg: &ServerConfig, clients: &mut [Client], child: Pid) -> ! {
     for c in clients.iter_mut() {
         let _ = packet.write_to(&mut c.stream);
     }
-    let _ = std::fs::remove_file(&cfg.socket_path);
+    let _ = std::fs::remove_file(socket_path);
     exit(0);
 }
 

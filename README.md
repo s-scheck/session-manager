@@ -24,6 +24,7 @@ on `nix` and `libc`.
 
 ```
 sm [-a|-A|-c|-n] [-p] [-r] [-q] [-l] [-L] [-f] [-e detachkey] name [command ...]
+sm -R old new  # rename a session
 sm -l          # list sessions
 sm -v          # version
 ```
@@ -35,6 +36,7 @@ sm -v          # version
 | `-a` | **attach** to an existing session (error if absent) |
 | `-A` | **attach** if it exists, else **create** and attach |
 | `-n` | create a new session but do **not** attach (headless) |
+| `-R` | **rename** an existing session: `sm -R oldname newname` |
 | *(none)* + name | defaults to `-A` (attach-or-create) |
 
 ### Options
@@ -63,6 +65,7 @@ sm -a work            # reattach; your shell is exactly where you left it
 
 sm -n build make      # run `make` headless in the background
 sm -l                 # list sessions: * attached, - detached, ? stale
+sm -R work project    # rename the "work" session to "project"
 sm -A notes vim notes # attach if "notes" exists, else create it running vim
 sm -r work            # attach as a read-only spectator
 sm -c k -e ^q bash    # override the detach key (Ctrl-q here; default is Ctrl-o)

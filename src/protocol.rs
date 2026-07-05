@@ -34,6 +34,8 @@ pub enum Packet {
     Exit(i32),
     /// Server → new client right after accept: the server's pid.
     Pid(u32),
+    /// Client → server: rename the session (and its socket) to this name.
+    Rename(String),
 }
 
 // Wire type tags (must stay stable across client/server of the same build).
@@ -43,6 +45,7 @@ const T_DETACH: u32 = 2;
 const T_RESIZE: u32 = 3;
 const T_EXIT: u32 = 4;
 const T_PID: u32 = 5;
+const T_RENAME: u32 = 6;
 
 impl Packet {
     fn tag(&self) -> u32 {
@@ -53,6 +56,7 @@ impl Packet {
             Packet::Resize { .. } => T_RESIZE,
             Packet::Exit(_) => T_EXIT,
             Packet::Pid(_) => T_PID,
+            Packet::Rename(_) => T_RENAME,
         }
     }
 
@@ -70,6 +74,7 @@ impl Packet {
             }
             Packet::Exit(status) => status.to_le_bytes().to_vec(),
             Packet::Pid(pid) => pid.to_le_bytes().to_vec(),
+            Packet::Rename(name) => name.as_bytes().to_vec(),
         }
     }
 
@@ -143,6 +148,12 @@ impl Packet {
                     payload[0..4].try_into().unwrap(),
                 )))
             }
+            T_RENAME => {
+                let name = String::from_utf8(payload).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "rename name not UTF-8")
+                })?;
+                Ok(Packet::Rename(name))
+            }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown packet type {other}"),
@@ -175,6 +186,7 @@ mod tests {
         roundtrip(Packet::Exit(7));
         roundtrip(Packet::Exit(-1));
         roundtrip(Packet::Pid(12345));
+        roundtrip(Packet::Rename("new-name".to_string()));
     }
 
     #[test]

@@ -48,6 +48,27 @@ pub fn current_termios() -> Option<Termios> {
     termios::tcgetattr(borrowed).ok()
 }
 
+/// Ask the running server to rename its session (and socket) to `new_name`.
+/// `new_path` is where the renamed socket should end up; the caller is expected
+/// to have already cleared any stale file there and confirmed no live session
+/// owns it. Returns once the server has performed the rename.
+pub fn rename(old_path: &Path, new_path: &Path, new_name: &str) -> io::Result<()> {
+    let mut sock = UnixStream::connect(old_path)?;
+    Packet::Rename(new_name.to_string()).write_to(&mut sock)?;
+    // The server renames and then drops this control connection. Wait for the
+    // new socket path to appear as confirmation.
+    for _ in 0..100 {
+        if new_path.exists() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "server did not complete the rename",
+    ))
+}
+
 /// Attach to the session and run the proxy loop until detach or exit.
 pub fn attach(cfg: ClientConfig) -> io::Result<Outcome> {
     let mut sock = UnixStream::connect(cfg.socket_path)?;

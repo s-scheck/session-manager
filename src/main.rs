@@ -36,6 +36,8 @@ enum Action {
     Create,
     /// -n: create a new session, do not attach.
     CreateNoAttach,
+    /// -R: rename an existing session (`sm -R oldname newname`).
+    Rename,
 }
 
 struct Options {
@@ -68,6 +70,7 @@ fn main() {
 fn usage() {
     eprintln!(
         "usage: sm [-a|-A|-c|-n] [-p] [-r] [-q] [-l] [-L] [-f] [-e detachkey] name [command ...]\n\
+         \x20      sm -R oldname newname     rename a session\n\
          \x20      sm -l                     list sessions\n\
          \x20      sm -v                     print version"
     );
@@ -116,6 +119,7 @@ fn run(opts: Options) -> i32 {
             }
             attach(&opts, &path)
         }
+        Action::Rename => rename(&opts, &name, &path, &dir, alive),
         Action::AttachOrCreate => {
             if alive {
                 attach(&opts, &path)
@@ -170,6 +174,52 @@ fn attach(opts: &Options, path: &Path) -> i32 {
     }
 }
 
+/// Rename an existing session: `sm -R oldname newname`. `name`/`path` refer to
+/// the existing session; the new name comes from the first command-slot arg.
+fn rename(opts: &Options, name: &str, path: &Path, dir: &Path, alive: bool) -> i32 {
+    if !alive {
+        eprintln!("sm: no such session: {name}");
+        return 1;
+    }
+    let new_name = match opts.command.first() {
+        Some(n) => n.clone(),
+        None => {
+            eprintln!("sm: rename requires a new name (sm -R {name} <newname>)");
+            return 1;
+        }
+    };
+    let new_path = match sockdir::socket_path(dir, &new_name) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("sm: {e}");
+            return 1;
+        }
+    };
+    if new_name == name {
+        return 0; // no-op
+    }
+    if sockdir::session_alive(&new_path) {
+        eprintln!("sm: a session named '{new_name}' already exists");
+        return 1;
+    }
+    // Clear any stale socket at the target so the rename lands cleanly and its
+    // appearance is a reliable success signal.
+    let _ = std::fs::remove_file(&new_path);
+
+    match client::rename(path, &new_path, &new_name) {
+        Ok(()) => {
+            if !opts.quiet {
+                eprintln!("sm: renamed '{name}' -> '{new_name}'");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("sm: rename failed: {e}");
+            1
+        }
+    }
+}
+
 /// Build the command vector: explicit CLI args, else $SM_CMD, else $SHELL, else /bin/sh.
 fn resolve_command(opts: &Options) -> Vec<String> {
     if !opts.command.is_empty() {
@@ -204,6 +254,9 @@ fn create(opts: &Options, name: &str, path: &Path, do_attach: bool) -> i32 {
     // Capture the current terminal size and modes so the pty starts matching.
     let winsize = pty::get_winsize(libc::STDIN_FILENO);
     let termios = client::current_termios();
+    // Run the command in the directory we were invoked from (the daemon itself
+    // chdirs to "/", so we pass this through for the command to restore).
+    let workdir = std::env::current_dir().ok();
 
     let server_cfg = ServerConfig {
         socket_path: path.to_path_buf(),
@@ -211,6 +264,7 @@ fn create(opts: &Options, name: &str, path: &Path, do_attach: bool) -> i32 {
         argv,
         winsize,
         termios,
+        workdir,
     };
 
     // Error-reporting pipe: the exec'd command's write end is CLOEXEC, so a
@@ -362,6 +416,7 @@ fn parse_args() -> Result<Options, String> {
                     'A' => set_action(&mut opts, Action::AttachOrCreate)?,
                     'c' => set_action(&mut opts, Action::Create)?,
                     'n' => set_action(&mut opts, Action::CreateNoAttach)?,
+                    'R' => set_action(&mut opts, Action::Rename)?,
                     'f' => opts.force = true,
                     'l' => opts.list = true,
                     'L' => opts.lowpriority = true,
