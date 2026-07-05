@@ -1,6 +1,7 @@
 //! The session server: a daemon that owns the pty running the supervised
 //! command and multiplexes it to any attached clients over the Unix socket.
 
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -39,6 +40,11 @@ struct Client {
     readonly: bool,
     lowpriority: bool,
 }
+
+/// How many bytes of recent pty output to retain and replay to a client when it
+/// attaches, so the screen isn't blank on reattach. Not a full scrollback/VT
+/// emulator — just enough raw output that the last screenful(s) repaint.
+const REPLAY_CAP: usize = 64 * 1024;
 
 /// Run the server to completion. Never returns: it `exit`s when the supervised
 /// command dies (or on SIGTERM/SIGINT). `err_pipe` is the write end of a pipe
@@ -103,6 +109,8 @@ fn event_loop(
     // The active socket path. A Rename packet updates this so status updates and
     // cleanup on exit follow the renamed file.
     let mut socket_path = cfg.socket_path.clone();
+    // Ring buffer of recent pty output, replayed to clients on attach.
+    let mut replay: VecDeque<u8> = VecDeque::with_capacity(REPLAY_CAP);
 
     loop {
         // Build the poll set: signals, listener, pty, then each client.
@@ -151,6 +159,11 @@ fn event_loop(
             match read_fd(pty_fd, &mut buf) {
                 Ok(0) | Err(_) => shutdown(&socket_path, &mut clients, child),
                 Ok(n) => {
+                    // Retain recent output for replay-on-attach, trimming the front.
+                    replay.extend(&buf[..n]);
+                    if replay.len() > REPLAY_CAP {
+                        replay.drain(0..replay.len() - REPLAY_CAP);
+                    }
                     let packet = Packet::Content(buf[..n].to_vec());
                     clients.retain_mut(|c| packet.write_to(&mut c.stream).is_ok());
                 }
@@ -165,7 +178,7 @@ fn event_loop(
             if !readable(client_base + idx) {
                 continue;
             }
-            if !handle_client_packet(&mut socket_path, &mut clients, idx, pty_fd) {
+            if !handle_client_packet(&mut socket_path, &replay, &mut clients, idx, pty_fd) {
                 disconnected.push(idx);
             }
         }
@@ -192,6 +205,7 @@ fn event_loop(
 /// disconnected (and should be pruned).
 fn handle_client_packet(
     socket_path: &mut PathBuf,
+    replay: &VecDeque<u8>,
     clients: &mut [Client],
     idx: usize,
     pty_fd: RawFd,
@@ -218,6 +232,17 @@ fn handle_client_packet(
         Packet::Attach { flags } => {
             clients[idx].readonly = flags & FLAG_READONLY != 0;
             clients[idx].lowpriority = flags & FLAG_LOWPRIORITY != 0;
+            // Replay recent output so the freshly-attached client repaints
+            // instead of showing a blank screen.
+            let snapshot: Vec<u8> = replay.iter().copied().collect();
+            for chunk in snapshot.chunks(MAX_PAYLOAD) {
+                if Packet::Content(chunk.to_vec())
+                    .write_to(&mut clients[idx].stream)
+                    .is_err()
+                {
+                    return false;
+                }
+            }
             true
         }
         Packet::Detach => false,

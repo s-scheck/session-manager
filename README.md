@@ -96,8 +96,13 @@ attach to your sessions.
 - Session state (attached / detached) is encoded in the socket's permission bits,
   so listing reads status from `stat(2)` without connecting; liveness is confirmed
   by a `Pid` handshake.
+- The server keeps a small ring buffer (64 KB) of recent pty output and replays it
+  when a client attaches, so reattaching repaints your recent output instead of
+  showing a blank screen. This is a lightweight replay, not a full terminal
+  emulator/scrollback — the last screenful(s) repaint correctly.
 - Signals use the self-pipe trick (handlers only `write()` a byte; the event loop
   does the work) so nothing unsafe happens in a signal handler.
 
 Not implemented — deliberately, matching abduco's minimalism: window splitting
-(that's a multiplexer's job), config files, and scrollback.
+(that's a multiplexer's job), config files, and full scrollback / VT emulation
+(there's a lightweight replay-on-attach instead, see above).
