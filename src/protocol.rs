@@ -78,16 +78,20 @@ impl Packet {
         }
     }
 
+    /// Serialize this packet (header + payload) into a byte vector, ready to be
+    /// appended to an output buffer for non-blocking, buffered sending.
+    pub fn encode(&self) -> Vec<u8> {
+        let payload = self.payload();
+        let mut v = Vec::with_capacity(HEADER_LEN + payload.len());
+        v.extend_from_slice(&self.tag().to_le_bytes());
+        v.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        v.extend_from_slice(&payload);
+        v
+    }
+
     /// Serialize and write this packet in full. Blocking; handles short writes.
     pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        let payload = self.payload();
-        let mut header = [0u8; HEADER_LEN];
-        header[0..4].copy_from_slice(&self.tag().to_le_bytes());
-        header[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        w.write_all(&header)?;
-        if !payload.is_empty() {
-            w.write_all(&payload)?;
-        }
+        w.write_all(&self.encode())?;
         w.flush()
     }
 
@@ -96,7 +100,6 @@ impl Packet {
     pub fn read_from<R: Read>(r: &mut R) -> io::Result<Packet> {
         let mut header = [0u8; HEADER_LEN];
         r.read_exact(&mut header)?;
-        let tag = u32::from_le_bytes(header[0..4].try_into().unwrap());
         let len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
         if len > MAX_PAYLOAD {
             return Err(io::Error::new(
@@ -108,7 +111,37 @@ impl Packet {
         if len > 0 {
             r.read_exact(&mut payload)?;
         }
+        let tag = u32::from_le_bytes(header[0..4].try_into().unwrap());
+        Self::decode(tag, payload)
+    }
 
+    /// Try to decode one packet from the front of `buf`, removing its bytes on
+    /// success. `Ok(None)` means more bytes are needed; `Err` is a protocol
+    /// violation (the caller should disconnect the peer). Used for non-blocking,
+    /// incrementally-buffered reads.
+    pub fn try_decode(buf: &mut Vec<u8>) -> io::Result<Option<Packet>> {
+        if buf.len() < HEADER_LEN {
+            return Ok(None);
+        }
+        let len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        if len > MAX_PAYLOAD {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("packet payload too large: {len}"),
+            ));
+        }
+        if buf.len() < HEADER_LEN + len {
+            return Ok(None);
+        }
+        let tag = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let payload = buf[HEADER_LEN..HEADER_LEN + len].to_vec();
+        let pkt = Self::decode(tag, payload)?;
+        buf.drain(0..HEADER_LEN + len);
+        Ok(Some(pkt))
+    }
+
+    /// Decode a packet from its tag and payload bytes.
+    fn decode(tag: u32, payload: Vec<u8>) -> io::Result<Packet> {
         let expect = |need: usize| -> io::Result<()> {
             if payload.len() < need {
                 Err(io::Error::new(
@@ -192,6 +225,30 @@ mod tests {
     #[test]
     fn max_payload_roundtrips() {
         roundtrip(Packet::Content(vec![0xAB; MAX_PAYLOAD]));
+    }
+
+    #[test]
+    fn try_decode_streams_multiple_packets() {
+        // Two packets concatenated, plus a partial third.
+        let mut buf = Vec::new();
+        buf.extend(Packet::Content(b"ab".to_vec()).encode());
+        buf.extend(Packet::Resize { rows: 5, cols: 9 }.encode());
+        let partial = Packet::Pid(7).encode();
+        buf.extend_from_slice(&partial[..3]); // only 3 bytes of the third
+
+        assert_eq!(
+            Packet::try_decode(&mut buf).unwrap(),
+            Some(Packet::Content(b"ab".to_vec()))
+        );
+        assert_eq!(
+            Packet::try_decode(&mut buf).unwrap(),
+            Some(Packet::Resize { rows: 5, cols: 9 })
+        );
+        // Third is incomplete -> None, bytes retained.
+        assert_eq!(Packet::try_decode(&mut buf).unwrap(), None);
+        buf.extend_from_slice(&partial[3..]);
+        assert_eq!(Packet::try_decode(&mut buf).unwrap(), Some(Packet::Pid(7)));
+        assert!(buf.is_empty());
     }
 
     #[test]

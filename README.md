@@ -42,7 +42,7 @@ sm -v          # version
 ### Options
 | Flag | Meaning |
 |------|---------|
-| `-e key` | set the detach key (default `^o`); accepts `^x`, a single char, or a decimal byte |
+| `-e key` | set the detach **prefix** key (default `^a`); accepts `^x`, a single char, or a decimal byte |
 | `-r` | read-only: your input is ignored, output still streamed |
 | `-L` | low priority: never becomes the window-size-controlling client |
 | `-p` | passthrough: forward stdin verbatim, no raw mode / detach key |
@@ -53,8 +53,24 @@ sm -v          # version
 If no command is given, `sm` runs `$SM_CMD`, else `$SHELL`, else `/bin/sh`.
 
 ### Detaching
-While attached, press the detach key (default **Ctrl-o**) to detach and leave the
-program running. Reattach with `sm -a name`.
+Detaching uses a two-key **prefix** sequence (like tmux/screen), so it doesn't
+collide with keys your programs use:
+
+- **prefix** then **`d`** → detach (default prefix is **Ctrl-a**, i.e. `Ctrl-a d`).
+- **prefix** twice → sends one literal prefix byte to the program.
+- **prefix** then any other key → both are sent to the program, so the prefix key
+  still works inside apps. A lone prefix press is also forwarded after a short
+  timeout.
+
+Reattach with `sm -a name`. Change the prefix with `-e` (e.g. `-e ^b` for Ctrl-b,
+`-e ^o` for Ctrl-o). Pick a prefix you don't rely on in your editor.
+
+To keep the prefix reliable and to avoid a program inside the session leaving
+your outer shell in a weird state, `sm` keeps the terminal in the classic
+keyboard encoding while attached (it filters the kitty keyboard protocol and
+xterm `modifyOtherKeys` out of program output) and resets keyboard/mouse/paste
+modes on detach. Programs like neovim run in the classic (legacy) key encoding
+under `sm`.
 
 ## Examples
 
@@ -68,7 +84,7 @@ sm -l                 # list sessions: * attached, - detached, ? stale
 sm -R work project    # rename the "work" session to "project"
 sm -A notes vim notes # attach if "notes" exists, else create it running vim
 sm -r work            # attach as a read-only spectator
-sm -c k -e ^q bash    # override the detach key (Ctrl-q here; default is Ctrl-o)
+sm -c k -e ^q bash    # override the prefix key (Ctrl-q here; detach = Ctrl-q d)
 ```
 
 When the supervised command exits, an attached `sm` exits with the command's exit

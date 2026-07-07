@@ -10,8 +10,19 @@ use crate::sys::write_all_fd;
 
 // Enter the alternate screen buffer and home the cursor.
 const ENTER_ALT: &[u8] = b"\x1b[?1049h\x1b[H";
-// Show the cursor and leave the alternate screen buffer.
-const LEAVE_ALT: &[u8] = b"\x1b[?25h\x1b[?1049l";
+
+// Force the classic keyboard encoding on attach: pop any kitty keyboard
+// protocol entry and turn off xterm's modifyOtherKeys. Combined with filtering
+// these out of application output (see client::OutputFilter), this keeps Ctrl
+// keys arriving as plain control bytes so detach detection is reliable.
+const DISABLE_KBD: &[u8] = b"\x1b[<1u\x1b[>4;0m";
+
+// Full cleanup on detach: leave the alternate screen, show the cursor, and turn
+// off input modes a program inside the session may have enabled (enhanced
+// keyboard, mouse reporting, bracketed paste) so the outer shell is left clean
+// even when you detach from inside that program.
+const RESET_MODES: &[u8] = b"\x1b[?25h\x1b[?1049l\x1b[<1u\x1b[>4;0m\
+\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l";
 
 /// Puts the controlling terminal into raw mode + alternate screen for the
 /// duration of an attach, restoring the original state when dropped. Restoring
@@ -38,6 +49,7 @@ impl TerminalGuard {
         termios::tcsetattr(borrowed, SetArg::TCSANOW, &raw)?;
 
         write_all_fd(stdout, ENTER_ALT)?;
+        write_all_fd(stdout, DISABLE_KBD)?;
 
         Ok(TerminalGuard {
             tty,
@@ -53,6 +65,6 @@ impl Drop for TerminalGuard {
         // down.
         let borrowed = unsafe { BorrowedFd::borrow_raw(self.tty) };
         let _ = termios::tcsetattr(borrowed, SetArg::TCSANOW, &self.original);
-        let _ = write_all_fd(self.stdout, LEAVE_ALT);
+        let _ = write_all_fd(self.stdout, RESET_MODES);
     }
 }

@@ -24,7 +24,7 @@ use client::{ClientConfig, Outcome};
 use server::ServerConfig;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const DEFAULT_DETACH_KEY: u8 = 0x0f; // Ctrl-o (^o); easy to type on any layout
+const DEFAULT_PREFIX_KEY: u8 = 0x01; // Ctrl-a; press then 'd' to detach (screen-style)
 
 #[derive(Clone, Copy, PartialEq)]
 enum Action {
@@ -48,7 +48,7 @@ struct Options {
     lowpriority: bool,
     passthrough: bool,
     quiet: bool,
-    detach_key: u8,
+    prefix_key: u8,
     name: Option<String>,
     command: Vec<String>,
 }
@@ -69,10 +69,13 @@ fn main() {
 
 fn usage() {
     eprintln!(
-        "usage: sm [-a|-A|-c|-n] [-p] [-r] [-q] [-l] [-L] [-f] [-e detachkey] name [command ...]\n\
+        "usage: sm [-a|-A|-c|-n] [-p] [-r] [-q] [-l] [-L] [-f] [-e prefixkey] name [command ...]\n\
          \x20      sm -R oldname newname     rename a session\n\
          \x20      sm -l                     list sessions\n\
-         \x20      sm -v                     print version"
+         \x20      sm -v                     print version\n\
+         \n\
+         detach: press the prefix key (default Ctrl-a) then 'd'. Press the prefix\n\
+         twice to send one literal prefix to the program. Change it with -e."
     );
 }
 
@@ -152,7 +155,7 @@ fn attach(opts: &Options, path: &Path) -> i32 {
         socket_path: path,
         readonly: opts.readonly,
         lowpriority: opts.lowpriority,
-        detach_key: opts.detach_key,
+        prefix_key: opts.prefix_key,
         passthrough: opts.passthrough,
     };
     match client::attach(cfg) {
@@ -384,7 +387,7 @@ fn parse_args() -> Result<Options, String> {
         lowpriority: false,
         passthrough: false,
         quiet: false,
-        detach_key: DEFAULT_DETACH_KEY,
+        prefix_key: DEFAULT_PREFIX_KEY,
         name: None,
         command: Vec::new(),
     };
@@ -438,7 +441,7 @@ fn parse_args() -> Result<Options, String> {
                                 .cloned()
                                 .ok_or_else(|| "-e requires a key argument".to_string())?
                         };
-                        opts.detach_key = parse_detach_key(&spec)?;
+                        opts.prefix_key = parse_detach_key(&spec)?;
                         break; // consumed the remainder of this token
                     }
                     other => return Err(format!("unknown option -{other}")),
