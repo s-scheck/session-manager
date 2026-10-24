@@ -24,7 +24,8 @@ on `nix` and `libc`.
 ## Usage
 
 ```
-sm [-a|-A|-c|-n] [-p] [-r] [-q] [-l] [-L] [-f] [-e detachkey] name [command ...]
+sm [-a|-A|-c|-n] [-d] [-p] [-r] [-q] [-L] [-f] [-e prefixkey] name [command ...]
+sm -k name     # kill a session
 sm -R old new  # rename a session
 sm -l          # list sessions
 sm -v          # version
@@ -37,6 +38,7 @@ sm -v          # version
 | `-a` | **attach** to an existing session (error if absent) |
 | `-A` | **attach** if it exists, else **create** and attach |
 | `-n` | create a new session but do **not** attach (headless) |
+| `-k` | **kill** a session: `sm -k name` (returns once it has ended) |
 | `-R` | **rename** an existing session: `sm -R oldname newname` |
 | *(none)* + name | defaults to `-A` (attach-or-create) |
 
@@ -44,6 +46,7 @@ sm -v          # version
 | Flag | Meaning |
 |------|---------|
 | `-e key` | set the detach **prefix** key (default `^a`); accepts caret notation (`^x`, `^\`, `^?`), a single ASCII char, or a decimal byte below 128 — anything but `d` |
+| `-d` | detach every **other** client when attaching (like `tmux attach -d`) |
 | `-r` | read-only: your input is ignored, output still streamed |
 | `-L` | low priority: never becomes the window-size-controlling client |
 | `-p` | passthrough: forward stdin verbatim, no raw mode / detach key |
@@ -79,6 +82,8 @@ under `sm`.
 sm -c work            # start a shell in session "work", attached
 # ... press Ctrl-a d to detach ...
 sm -a work            # reattach; your shell is exactly where you left it
+sm -da work           # reattach and detach the client still attached elsewhere
+sm -k work            # end the session
 
 sm -n build make      # run `make` headless in the background
 sm -l                 # list sessions: * attached, - detached, ? stale or not responding
@@ -90,9 +95,13 @@ sm -c k -e ^q bash    # override the prefix key (Ctrl-q here; detach = Ctrl-q d)
 
 When the supervised command exits, an attached `sm` exits with the command's exit
 status (`128 + n` if it was killed by signal `n`), after receiving everything the
-command printed. A session lives exactly as long as its command. Sending the
-server SIGTERM, SIGINT or SIGHUP hangs up the session's terminal, like closing a
-terminal window: the command receives SIGHUP.
+command printed. A session lives exactly as long as its command. `sm -k` (or
+sending the server SIGTERM, SIGINT or SIGHUP) hangs up the session's terminal,
+like closing a terminal window: the command receives SIGHUP, and if it ignores
+that, it is killed (SIGKILL) after 3 seconds.
+
+A client detached by someone else's `-d` exits with status 0 and the message
+`detached (session attached elsewhere with -d)`.
 
 When several clients are attached, the most recently attached one that is
 neither `-r` nor `-L` (nor in passthrough mode) controls the window size; when it

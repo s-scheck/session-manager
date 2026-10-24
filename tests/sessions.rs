@@ -6,7 +6,8 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -55,12 +56,38 @@ impl Sessions {
 
     /// Attach in passthrough mode with stdin left open for the caller.
     fn attach_piped(&self, name: &str) -> Child {
-        self.sm(&["-p", "-a", name])
-            .stdin(Stdio::piped())
+        self.attach_command(name, &[]).spawn().unwrap()
+    }
+
+    /// Attach in passthrough mode (plus `flags`), collecting the client's
+    /// output in the background so the test can wait for it while the client
+    /// keeps running.
+    fn attach_watched(&self, name: &str, flags: &[&str]) -> Watched {
+        let mut child = self.attach_command(name, flags).spawn().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&output);
+        let reader = thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = stdout.read(&mut buf) {
+                sink.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+        Watched {
+            child,
+            stdin,
+            output,
+            reader,
+        }
+    }
+
+    fn attach_command(&self, name: &str, flags: &[&str]) -> Command {
+        let mut cmd = self.sm(&[flags, &["-p", "-a", name]].concat());
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap()
+            .stderr(Stdio::piped());
+        cmd
     }
 
     /// `sm -l` output as (status, name, pid) rows.
@@ -84,6 +111,48 @@ impl Sessions {
 impl Drop for Sessions {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A running client whose stdout is being collected.
+struct Watched {
+    child: Child,
+    stdin: ChildStdin,
+    output: Arc<Mutex<Vec<u8>>>,
+    reader: thread::JoinHandle<()>,
+}
+
+impl Watched {
+    fn output(&self) -> String {
+        String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
+    }
+
+    /// Wait until the client has printed `marker`. Since every attaching client
+    /// first receives the session's recent output, this also confirms that it
+    /// has attached.
+    fn wait_for(&self, marker: &str) {
+        wait_until(&format!("{marker:?} in the client's output"), || {
+            self.output().contains(marker)
+        });
+    }
+
+    fn send(&mut self, input: &[u8]) {
+        self.stdin.write_all(input).unwrap();
+    }
+
+    /// Wait for the client to exit: (exit code, stdout, stderr).
+    fn finish(self) -> (Option<i32>, String, String) {
+        let Watched {
+            child,
+            stdin,
+            output,
+            reader,
+        } = self;
+        drop(stdin);
+        let out = wait_with_timeout(child);
+        reader.join().unwrap();
+        let stdout = String::from_utf8_lossy(&output.lock().unwrap()).into_owned();
+        (out.status.code(), stdout, stderr(&out))
     }
 }
 
@@ -271,6 +340,61 @@ fn termination_signal_hangs_up_the_session() {
 }
 
 #[test]
+fn kill_ends_the_session_for_every_client() {
+    let s = Sessions::new("kill");
+    s.create("doomed", "echo ready; read x");
+    let attached = s.attach_watched("doomed", &[]);
+    attached.wait_for("ready");
+
+    let out = s.run(&["-k", "doomed"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // `sm -k` returns only once the session is gone.
+    assert!(!s.socket("doomed").exists());
+    let (code, _, err) = attached.finish();
+    assert_eq!(code, Some(128 + 1), "{err}");
+
+    let out = s.run(&["-k", "doomed"]);
+    assert!(stderr(&out).contains("no such session"), "{}", stderr(&out));
+}
+
+#[test]
+fn kill_escalates_when_the_hangup_is_ignored() {
+    let s = Sessions::new("stubborn");
+    s.create("stubborn", "trap '' HUP; echo ready; exec sleep 60");
+    let attached = s.attach_watched("stubborn", &[]);
+    // Once "ready" is printed, the hangup is ignored by the command.
+    attached.wait_for("ready");
+
+    let out = s.run(&["-k", "stubborn"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let (code, _, err) = attached.finish();
+    assert_eq!(code, Some(128 + 9), "killed after the grace period: {err}");
+}
+
+#[test]
+fn attaching_with_d_detaches_the_other_clients() {
+    let s = Sessions::new("takeover");
+    s.create("shared", r#"echo ready; read x; echo "got:$x"; exit 2"#);
+    let first = s.attach_watched("shared", &[]);
+    let second = s.attach_watched("shared", &["-r"]);
+    first.wait_for("ready");
+    second.wait_for("ready");
+
+    let mut taker = s.attach_watched("shared", &["-d"]);
+    for displaced in [first, second] {
+        let (code, _, err) = displaced.finish();
+        assert_eq!(code, Some(0), "{err}");
+        assert!(err.contains("attached elsewhere"), "{err}");
+    }
+
+    // The session itself is unaffected and now serves the new client.
+    taker.send(b"hi\n");
+    let (code, out, err) = taker.finish();
+    assert_eq!(code, Some(2), "{err}");
+    assert!(out.contains("got:hi"), "{out}");
+}
+
+#[test]
 fn stale_sockets_need_force_or_attach_or_create() {
     let s = Sessions::new("stale");
     let stale = || drop(UnixListener::bind(s.socket("old")).unwrap());
@@ -316,7 +440,11 @@ fn incompatible_server_is_reported_and_left_alone() {
     );
 
     let out = s.run(&["-A", "legacy"]);
-    assert!(stderr(&out).contains("not responding"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("cannot connect") && stderr(&out).contains("incompatible version"),
+        "{}",
+        stderr(&out)
+    );
     assert!(
         s.socket("legacy").exists(),
         "a running session must not be replaced"

@@ -1,6 +1,6 @@
 //! The client side: connecting to a session (with the protocol handshake),
-//! probing liveness, renaming, and attaching — putting the real terminal in raw
-//! mode and proxying bytes between it and the server.
+//! probing liveness, renaming, killing, and attaching — putting the real
+//! terminal in raw mode and proxying bytes between it and the server.
 
 use std::io::{self, IsTerminal, Read};
 use std::os::fd::{AsRawFd, RawFd};
@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use nix::sys::signal::Signal;
 
-use crate::protocol::{self, FLAG_LOWPRIORITY, FLAG_READONLY, MAX_PAYLOAD, Packet};
+use crate::protocol::{
+    self, FLAG_DETACH_OTHERS, FLAG_LOWPRIORITY, FLAG_READONLY, HANGUP_GRACE, MAX_PAYLOAD, Packet,
+};
 use crate::pty;
 use crate::signals::SignalPipe;
 use crate::sys::{self, read_fd, write_all_fd};
@@ -33,6 +35,8 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 pub enum Outcome {
     /// User pressed the detach sequence (or the terminal went away).
     Detached,
+    /// Another client attached with `-d` and took over the session.
+    Displaced,
     /// The supervised command exited with this status.
     Exited(i32),
 }
@@ -45,6 +49,8 @@ pub struct AttachOptions {
     pub lowpriority: bool,
     /// Forward stdin verbatim: no raw mode, no detach key (`-p`).
     pub passthrough: bool,
+    /// Detach every other client when attaching (`-d`).
+    pub detach_others: bool,
     /// Prefix byte; press it then `d` to detach (default Ctrl-a = 0x01). Press
     /// it twice to send one literal prefix byte to the app.
     pub prefix_key: u8,
@@ -112,6 +118,21 @@ impl Connection {
         }
     }
 
+    /// Ask the server to end the session. Returns the command's exit status
+    /// once the session has ended.
+    pub fn kill(mut self) -> io::Result<i32> {
+        Packet::Kill.write_to(&mut self.stream)?;
+        // The server hangs up the terminal and, at the latest after the grace
+        // period, kills the command.
+        self.stream
+            .set_read_timeout(Some(HANGUP_GRACE + RESPONSE_TIMEOUT))?;
+        match Packet::read_from(&mut self.stream).map_err(describe_timeout)? {
+            Packet::Exit(status) => Ok(status),
+            Packet::Error(msg) => Err(io::Error::other(msg)),
+            other => Err(unexpected(&other)),
+        }
+    }
+
     /// Attach to the session and proxy the terminal until detach or exit.
     pub fn attach(self, opts: &AttachOptions) -> io::Result<Outcome> {
         let Connection { mut stream, .. } = self;
@@ -125,6 +146,9 @@ impl Connection {
         }
         if opts.lowpriority || !interactive {
             flags |= FLAG_LOWPRIORITY;
+        }
+        if opts.detach_others {
+            flags |= FLAG_DETACH_OTHERS;
         }
 
         // Install the SIGWINCH handler before the size is first read, so a
@@ -249,6 +273,7 @@ impl Proxy {
             match packet {
                 Packet::Content(bytes) => self.write_output(&bytes)?,
                 Packet::Exit(status) => return Ok(Some(Outcome::Exited(status))),
+                Packet::Detach => return Ok(Some(Outcome::Displaced)),
                 Packet::Error(msg) => return Err(io::Error::other(msg)),
                 other => return Err(unexpected(&other)),
             }

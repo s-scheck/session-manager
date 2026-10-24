@@ -9,9 +9,10 @@
 //! Lifecycle: the session lives exactly as long as the supervised command.
 //! When the command exits, the output it left in the pty is drained and
 //! delivered, attached clients receive its exit status, and the socket is
-//! removed. A termination signal (SIGTERM/SIGINT/SIGHUP) to the server hangs
-//! up the terminal, as closing a terminal window would; the command then exits
-//! through that same path.
+//! removed. A `Kill` request or a termination signal (SIGTERM/SIGINT/SIGHUP)
+//! to the server hangs up the terminal, as closing a terminal window would; a
+//! command that ignores the hangup is killed after `HANGUP_GRACE`. Either way
+//! it exits through that same path.
 
 use std::collections::VecDeque;
 use std::ffi::CString;
@@ -30,7 +31,10 @@ use nix::sys::termios::Termios;
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, chdir, execvp, fork, setsid};
 
-use crate::protocol::{FLAG_LOWPRIORITY, FLAG_READONLY, MAX_PAYLOAD, PROTOCOL_VERSION, Packet};
+use crate::protocol::{
+    FLAG_DETACH_OTHERS, FLAG_LOWPRIORITY, FLAG_READONLY, HANGUP_GRACE, MAX_PAYLOAD,
+    PROTOCOL_VERSION, Packet,
+};
 use crate::pty::{self, Winsize};
 use crate::signals::{self, SignalPipe};
 use crate::sockdir;
@@ -143,10 +147,12 @@ struct Client {
 }
 
 enum ClientState {
-    /// Greeted; may now attach or make a one-shot request (rename).
+    /// Greeted; may now attach or make a one-shot request (rename, kill).
     Connected,
     /// Receiving the session's output.
     Attached(Attachment),
+    /// Requested a kill; waits for the session to end to receive the status.
+    AwaitingExit,
     /// Done; dropped once its pending output has been written.
     Closing,
     /// Gone (hung up, errored, broke protocol, or fell too far behind).
@@ -181,6 +187,14 @@ impl Client {
 
     fn is_attached(&self) -> bool {
         self.attachment().is_some()
+    }
+
+    /// Whether the client is told the exit status when the session ends.
+    fn awaits_exit_status(&self) -> bool {
+        matches!(
+            self.state,
+            ClientState::Attached(_) | ClientState::AwaitingExit
+        )
     }
 
     fn is_finished(&self) -> bool {
@@ -257,6 +271,8 @@ struct Server {
     /// Keystrokes waiting for the command to read them.
     pty_input: Vec<u8>,
     child: Pid,
+    /// Set by a hangup: when the command gets killed if it is still running.
+    kill_deadline: Option<Instant>,
     /// The active socket path. Follows renames so status updates and cleanup
     /// on exit apply to the right file.
     socket_path: PathBuf,
@@ -306,6 +322,7 @@ impl Server {
             pty: Some(pty),
             pty_input: Vec::new(),
             child,
+            kill_deadline: None,
             socket_path: cfg.socket_path,
             clients: Vec::new(),
             replay: VecDeque::with_capacity(REPLAY_CAP),
@@ -349,12 +366,18 @@ impl Server {
                 fds.push(pollfd(c.stream.as_raw_fd(), events));
             }
 
-            if sys::poll(&mut fds, None).is_err() {
+            // Only wait with a deadline while a hung-up command is given time
+            // to exit.
+            let timeout = self
+                .kill_deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            if sys::poll(&mut fds, timeout).is_err() {
                 // poll(2) only fails on resource exhaustion; the session can't
                 // be served any more. End it as a hangup would.
                 self.hang_up();
                 return self.reap_child().unwrap_or(1);
             }
+            self.kill_if_overdue();
 
             if is_readable(&fds[SIGNALS])
                 && let Some(status) = self.handle_signals()
@@ -424,10 +447,24 @@ impl Server {
     /// Hang up the terminal, as closing a terminal window does: the command's
     /// process group receives SIGHUP and the pty is closed, so anything still
     /// using it sees the hangup too. The command's exit is then handled as
-    /// usual.
+    /// usual; if it ignores the hangup, it is killed after `HANGUP_GRACE`.
     fn hang_up(&mut self) {
         let _ = killpg(self.child, Signal::SIGHUP);
         self.close_pty();
+        self.kill_deadline
+            .get_or_insert_with(|| Instant::now() + HANGUP_GRACE);
+    }
+
+    /// Kill the command's process group once a hangup has gone unanswered for
+    /// too long. Its exit is then handled as usual.
+    fn kill_if_overdue(&mut self) {
+        if self
+            .kill_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.kill_deadline = None;
+            let _ = killpg(self.child, Signal::SIGKILL);
+        }
     }
 
     fn close_pty(&mut self) {
@@ -526,7 +563,7 @@ impl Server {
 
     fn handle_packet(&mut self, idx: usize, packet: Packet) {
         let ClientState::Attached(attachment) = &mut self.clients[idx].state else {
-            // A greeted connection may attach, or make one request and leave.
+            // A greeted connection may attach, or make one request.
             match packet {
                 Packet::Attach { flags } => self.attach(idx, flags),
                 Packet::Rename(new_name) => {
@@ -537,6 +574,11 @@ impl Server {
                     let client = &mut self.clients[idx];
                     client.send(&reply);
                     client.state = ClientState::Closing;
+                }
+                Packet::Kill => {
+                    // Answered with the exit status once the session has ended.
+                    self.clients[idx].state = ClientState::AwaitingExit;
+                    self.hang_up();
                 }
                 // Out of order, or server-to-client only.
                 _ => self.clients[idx].state = ClientState::Dead,
@@ -560,6 +602,16 @@ impl Server {
     }
 
     fn attach(&mut self, idx: usize, flags: u32) {
+        if flags & FLAG_DETACH_OTHERS != 0 {
+            for (other_idx, other) in self.clients.iter_mut().enumerate() {
+                if other_idx != idx && other.is_attached() {
+                    // Delivered after the output already queued for it.
+                    other.send(&Packet::Detach);
+                    other.state = ClientState::Closing;
+                }
+            }
+        }
+
         self.attach_count += 1;
         let client = &mut self.clients[idx];
         client.state = ClientState::Attached(Attachment {
@@ -650,12 +702,10 @@ impl Server {
     /// Drop finished clients and bring the window size and the socket's
     /// attach marker up to date.
     fn prune_clients(&mut self) {
-        let before = self.clients.len();
         self.clients.retain(|c| !c.is_finished());
-        if self.clients.len() != before {
-            // The controlling client may have left.
-            self.apply_window_size();
-        }
+        // The controlling client may have detached or been detached; this is
+        // a no-op while the size is unchanged.
+        self.apply_window_size();
         let attached = self.clients.iter().any(Client::is_attached);
         if attached != self.marked_attached {
             self.marked_attached = attached;
@@ -663,8 +713,9 @@ impl Server {
         }
     }
 
-    /// End the session: unpublish the socket, then tell every attached client
-    /// the exit status, giving slow ones a bounded time to receive it.
+    /// End the session: unpublish the socket, then tell every attached (or
+    /// waiting) client the exit status, giving slow ones a bounded time to
+    /// receive it.
     fn shut_down(&mut self, status: i32) {
         // Remove the socket first so nobody connects to (or lists) a session
         // that is going away.
@@ -672,7 +723,7 @@ impl Server {
 
         let exit = Packet::Exit(status).encode();
         for c in &mut self.clients {
-            if c.is_attached() {
+            if c.awaits_exit_status() {
                 c.send_encoded(&exit);
             }
             if !matches!(c.state, ClientState::Dead) {

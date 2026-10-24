@@ -6,7 +6,8 @@
 use crate::client::{AttachOptions, DETACH_KEY};
 
 pub const USAGE: &str = "\
-usage: sm [-a|-A|-c|-n] [-p] [-r] [-q] [-L] [-f] [-e prefixkey] name [command ...]
+usage: sm [-a|-A|-c|-n] [-d] [-p] [-r] [-q] [-L] [-f] [-e prefixkey] name [command ...]
+       sm -k name                kill a session
        sm -R oldname newname     rename a session
        sm -l                     list sessions
        sm -v                     print version
@@ -28,6 +29,7 @@ pub struct Cli {
 pub enum Command {
     List,
     Version,
+    Kill { name: String },
     Rename { from: String, to: String },
     Session(SessionArgs),
 }
@@ -59,6 +61,7 @@ pub enum Action {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Session(Action),
+    Kill,
     Rename,
 }
 
@@ -72,6 +75,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
         readonly: false,
         lowpriority: false,
         passthrough: false,
+        detach_others: false,
         prefix_key: DEFAULT_PREFIX_KEY,
     };
     let mut positionals = Vec::new();
@@ -94,7 +98,12 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
                 'A' => Mode::Session(Action::AttachOrCreate),
                 'c' => Mode::Session(Action::Create),
                 'n' => Mode::Session(Action::CreateDetached),
+                'k' => Mode::Kill,
                 'R' => Mode::Rename,
+                'd' => {
+                    attach.detach_others = true;
+                    continue;
+                }
                 'f' => {
                     force = true;
                     continue;
@@ -139,19 +148,25 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
                 other => return Err(format!("unknown option -{other}")),
             };
             if mode.is_some_and(|m| m != selected) {
-                return Err("only one of -a/-A/-c/-n/-R may be given".to_string());
+                return Err("only one of -a/-A/-c/-n/-k/-R may be given".to_string());
             }
             mode = Some(selected);
         }
     }
 
     let command = match (list, mode) {
-        (true, Some(_)) => return Err("-l cannot be combined with -a/-A/-c/-n/-R".to_string()),
+        (true, Some(_)) => {
+            return Err("-l cannot be combined with -a/-A/-c/-n/-k/-R".to_string());
+        }
         (true, None) if !positionals.is_empty() => {
             return Err("-l does not take a session name".to_string());
         }
         // A bare `sm` lists sessions too.
         (_, None) if positionals.is_empty() => Command::List,
+        (_, Some(Mode::Kill)) => match <[String; 1]>::try_from(positionals) {
+            Ok([name]) => Command::Kill { name },
+            Err(_) => return Err("kill takes exactly one name: sm -k name".to_string()),
+        },
         (_, Some(Mode::Rename)) => match <[String; 2]>::try_from(positionals) {
             Ok([from, to]) => Command::Rename { from, to },
             Err(_) => {
@@ -314,6 +329,27 @@ mod tests {
         );
         assert!(parse_str("-R old").is_err());
         assert!(parse_str("-R old new extra").is_err());
+    }
+
+    #[test]
+    fn kill_takes_exactly_one_name() {
+        assert_eq!(
+            parse_str("-k work").unwrap().command,
+            Command::Kill {
+                name: "work".into()
+            }
+        );
+        assert!(parse_str("-k").is_err());
+        assert!(parse_str("-k work extra").is_err());
+        assert!(parse_str("-k -a work").is_err());
+        assert!(parse_str("-l -k work").is_err());
+    }
+
+    #[test]
+    fn detach_others_is_an_attach_option() {
+        assert!(session_args("-d -a work").attach.detach_others);
+        assert!(session_args("-dA work").attach.detach_others);
+        assert!(!session_args("-a work").attach.detach_others);
     }
 
     #[test]

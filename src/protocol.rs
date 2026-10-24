@@ -12,9 +12,15 @@
 //! clear error instead of misinterpreted packets.
 
 use std::io::{self, Read, Write};
+use std::time::Duration;
 
-/// Bump whenever the meaning of any packet changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Bump whenever packets are added or their meaning changes.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// How long a command gets to exit after its session is hung up (by `Kill`
+/// or a termination signal to the server) before the server kills it. A
+/// client waiting for a kill to complete relies on this bound.
+pub const HANGUP_GRACE: Duration = Duration::from_secs(3);
 
 /// Max payload bytes carried in a single packet (abduco uses 4096 -
 /// 2*sizeof(u32) = 4088). Keeps individual reads/writes bounded; larger
@@ -23,10 +29,12 @@ pub const MAX_PAYLOAD: usize = 4096 - HEADER_LEN;
 
 const HEADER_LEN: usize = 8;
 
-// Client flags carried in an `Attach` packet (bitfield), mirroring abduco's
-// CLIENT_READONLY / CLIENT_LOWPRIORITY.
+// Client flags carried in an `Attach` packet (bitfield). The first two mirror
+// abduco's CLIENT_READONLY / CLIENT_LOWPRIORITY.
 pub const FLAG_READONLY: u32 = 1 << 0;
 pub const FLAG_LOWPRIORITY: u32 = 1 << 1;
+/// Detach every other client when attaching (like `tmux attach -d`).
+pub const FLAG_DETACH_OTHERS: u32 = 1 << 2;
 
 /// One framed message. Decoded/encoded to/from the wire header + payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,15 +42,18 @@ pub enum Packet {
     /// Raw terminal bytes. client→server = keystrokes, server→client = output.
     Content(Vec<u8>),
     /// Client → server: start receiving the session's output, with these
-    /// flags (readonly / lowpriority).
+    /// flags (`FLAG_*`).
     Attach { flags: u32 },
     /// Client → server: the attached client is leaving.
+    /// Server → client: the client was detached because another one attached
+    /// with `FLAG_DETACH_OTHERS`. Always the last packet of a connection.
     Detach,
     /// Client → server: the client's window size, applied to the pty with
     /// TIOCSWINSZ while that client controls the size.
     Resize { rows: u16, cols: u16 },
-    /// Server → attached clients: the supervised command exited with this
-    /// status. Always the last packet of a connection.
+    /// Server → attached clients (and a client that requested `Kill`): the
+    /// supervised command exited with this status. Always the last packet of a
+    /// connection.
     Exit(i32),
     /// Server → every new connection, first: the protocol version and the
     /// supervised command's pid.
@@ -53,6 +64,10 @@ pub enum Packet {
     Renamed,
     /// Server → client: the request failed, with a human-readable reason.
     Error(String),
+    /// Client → server: end the session by hanging up its terminal (the
+    /// command is killed if it doesn't exit within `HANGUP_GRACE`). The server
+    /// answers with `Exit` once the session has ended.
+    Kill,
 }
 
 // Wire type tags (must stay stable within one PROTOCOL_VERSION).
@@ -65,6 +80,7 @@ const T_HELLO: u32 = 5;
 const T_RENAME: u32 = 6;
 const T_RENAMED: u32 = 7;
 const T_ERROR: u32 = 8;
+const T_KILL: u32 = 9;
 
 impl Packet {
     fn tag(&self) -> u32 {
@@ -78,6 +94,7 @@ impl Packet {
             Packet::Rename(_) => T_RENAME,
             Packet::Renamed => T_RENAMED,
             Packet::Error(_) => T_ERROR,
+            Packet::Kill => T_KILL,
         }
     }
 
@@ -100,7 +117,7 @@ impl Packet {
                 buf.extend_from_slice(&pid.to_le_bytes());
             }
             Packet::Rename(text) | Packet::Error(text) => buf.extend_from_slice(text.as_bytes()),
-            Packet::Detach | Packet::Renamed => {}
+            Packet::Detach | Packet::Renamed | Packet::Kill => {}
         }
         let len = buf.len() - HEADER_LEN;
         // Producers split content into MAX_PAYLOAD chunks; anything larger
@@ -170,6 +187,7 @@ impl Packet {
             T_RENAME => Packet::Rename(utf8(payload)?),
             T_RENAMED => Packet::Renamed,
             T_ERROR => Packet::Error(utf8(payload)?),
+            T_KILL => Packet::Kill,
             other => return Err(invalid(format!("unknown packet type {other}"))),
         };
         Ok(packet)
@@ -255,6 +273,7 @@ mod tests {
         roundtrip(Packet::Rename("new-name".to_string()));
         roundtrip(Packet::Renamed);
         roundtrip(Packet::Error("nope".to_string()));
+        roundtrip(Packet::Kill);
     }
 
     #[test]
