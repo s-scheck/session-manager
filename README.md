@@ -15,6 +15,7 @@ per-session Unix-domain socket.
 ```sh
 cargo build --release
 # binary at ./target/release/sm
+cargo test   # unit tests + end-to-end tests against real sessions
 ```
 
 Requires a Unix-like OS (developed/tested on macOS; works on Linux). Depends only
@@ -42,7 +43,7 @@ sm -v          # version
 ### Options
 | Flag | Meaning |
 |------|---------|
-| `-e key` | set the detach **prefix** key (default `^a`); accepts `^x`, a single char, or a decimal byte |
+| `-e key` | set the detach **prefix** key (default `^a`); accepts caret notation (`^x`, `^\`, `^?`), a single ASCII char, or a decimal byte below 128 — anything but `d` |
 | `-r` | read-only: your input is ignored, output still streamed |
 | `-L` | low priority: never becomes the window-size-controlling client |
 | `-p` | passthrough: forward stdin verbatim, no raw mode / detach key |
@@ -76,11 +77,11 @@ under `sm`.
 
 ```sh
 sm -c work            # start a shell in session "work", attached
-# ... press Ctrl-\ to detach ...
+# ... press Ctrl-a d to detach ...
 sm -a work            # reattach; your shell is exactly where you left it
 
 sm -n build make      # run `make` headless in the background
-sm -l                 # list sessions: * attached, - detached, ? stale
+sm -l                 # list sessions: * attached, - detached, ? stale or not responding
 sm -R work project    # rename the "work" session to "project"
 sm -A notes vim notes # attach if "notes" exists, else create it running vim
 sm -r work            # attach as a read-only spectator
@@ -88,30 +89,51 @@ sm -c k -e ^q bash    # override the prefix key (Ctrl-q here; detach = Ctrl-q d)
 ```
 
 When the supervised command exits, an attached `sm` exits with the command's exit
-status.
+status (`128 + n` if it was killed by signal `n`), after receiving everything the
+command printed. A session lives exactly as long as its command. Sending the
+server SIGTERM, SIGINT or SIGHUP hangs up the session's terminal, like closing a
+terminal window: the command receives SIGHUP.
+
+When several clients are attached, the most recently attached one that is
+neither `-r` nor `-L` (nor in passthrough mode) controls the window size; when it
+detaches, control passes to the next one.
+
+`sm` never replaces a session it cannot rule out as running: a socket is only
+treated as stale when nothing listens on it at all. A session that does not
+answer (or was started by an incompatible `sm` version — e.g. after an upgrade)
+shows as `?` in the listing and is left alone.
 
 ## Environment
 | Variable | Purpose |
 |----------|---------|
 | `SM_CMD` | default command when none is given |
 | `SM_SOCKET_DIR` | preferred directory for session sockets |
-| `SM_SESSION` | *(set for the child)* the session name |
-| `SM_SOCKET` | *(set for the child)* absolute path of the session socket |
+| `SM_SESSION` | *(set for the child)* the session name at creation (not updated by `-R`) |
+| `SM_SOCKET` | *(set for the child)* absolute path of the session socket at creation (not updated by `-R`) |
 
 Sockets live in the first usable of: `$SM_SOCKET_DIR`, `$HOME/.session_manager`,
 `$TMPDIR/sm/$USER`, `/tmp/sm/$USER`. Session directories are created `0700` and are
 verified to be owned by you with no group/other access, so other users cannot
-attach to your sessions.
+attach to your sessions. A shared base such as `/tmp/sm` must be owned by root or
+you and be sticky, so no one else can swap out your directory inside it.
 
 ## How it works
-- **Create** double-forks and `setsid`s a daemon, which `forkpty`s the command and
-  binds the session socket.
+- **Create** double-forks and `setsid`s a daemon, which binds the session socket
+  and `forkpty`s the command. When `sm` attaches to a session it creates, it is
+  connected before the command starts, so even an instantly exiting command is
+  observed.
 - **Attach** connects a client, puts your terminal in raw mode + the alternate
   screen, and proxies bytes both ways; window-size changes propagate via
   `SIGWINCH` → `TIOCSWINSZ`.
+- The server is a single-threaded `poll(2)` loop that never blocks: input for a
+  program that is not reading it is buffered (up to 1 MB, beyond which it is
+  discarded like a full tty input queue), and output for a slow client is
+  buffered (a client more than 8 MB behind is disconnected).
 - Session state (attached / detached) is encoded in the socket's permission bits,
   so listing reads status from `stat(2)` without connecting; liveness is confirmed
-  by a `Pid` handshake.
+  by a `Hello` handshake that also checks the protocol version.
+- **Rename** is a request to the server, which links the socket to the new name
+  (refusing to replace an existing one) and confirms or reports why it failed.
 - The server keeps a small ring buffer (64 KB) of recent pty output and replays it
   when a client attaches, so reattaching repaints your recent output instead of
   showing a blank screen. This is a lightweight replay, not a full terminal

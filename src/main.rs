@@ -2,6 +2,7 @@
 //! reimplementation of abduco. One binary is both the client and the daemonized
 //! server; see the module docs for the split.
 
+mod cli;
 mod client;
 mod protocol;
 mod pty;
@@ -12,508 +13,242 @@ mod sys;
 mod term;
 
 use std::ffi::CString;
-use std::io::Read;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::fs;
+use std::io;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::exit;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use nix::sys::wait::waitpid;
-use nix::unistd::{ForkResult, chdir, fork, setsid};
-
-use client::{ClientConfig, Outcome};
+use cli::{Action, Cli, Command, SessionArgs};
+use client::{AttachOptions, Connection, Liveness, Outcome};
 use server::ServerConfig;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const DEFAULT_PREFIX_KEY: u8 = 0x01; // Ctrl-a; press then 'd' to detach (screen-style)
-
-#[derive(Clone, Copy, PartialEq)]
-enum Action {
-    /// -a: attach to an existing session (error if absent).
-    Attach,
-    /// -A: attach if present, else create and attach.
-    AttachOrCreate,
-    /// -c: create a new session and attach.
-    Create,
-    /// -n: create a new session, do not attach.
-    CreateNoAttach,
-    /// -R: rename an existing session (`sm -R oldname newname`).
-    Rename,
-}
-
-struct Options {
-    action: Option<Action>,
-    list: bool,
-    force: bool,
-    readonly: bool,
-    lowpriority: bool,
-    passthrough: bool,
-    quiet: bool,
-    prefix_key: u8,
-    name: Option<String>,
-    command: Vec<String>,
-}
 
 fn main() {
-    let opts = match parse_args() {
-        Ok(o) => o,
+    let cli = match cli::parse(std::env::args().skip(1)) {
+        Ok(cli) => cli,
         Err(msg) => {
-            if !msg.is_empty() {
-                eprintln!("sm: {msg}");
-            }
-            usage();
+            eprintln!("sm: {msg}");
+            eprintln!("{}", cli::USAGE);
             exit(1);
         }
     };
-    exit(run(opts));
+    let code = run(&cli).unwrap_or_else(|msg| {
+        eprintln!("sm: {msg}");
+        1
+    });
+    exit(code);
 }
 
-fn usage() {
-    eprintln!(
-        "usage: sm [-a|-A|-c|-n] [-p] [-r] [-q] [-l] [-L] [-f] [-e prefixkey] name [command ...]\n\
-         \x20      sm -R oldname newname     rename a session\n\
-         \x20      sm -l                     list sessions\n\
-         \x20      sm -v                     print version\n\
-         \n\
-         detach: press the prefix key (default Ctrl-a) then 'd'. Press the prefix\n\
-         twice to send one literal prefix to the program. Change it with -e."
-    );
-}
-
-fn run(opts: Options) -> i32 {
-    // Listing: explicit -l, or a bare invocation with nothing to act on.
-    if opts.list || (opts.action.is_none() && opts.name.is_none()) {
-        return do_list();
+/// Carry out the invocation; returns the process exit code, or an error
+/// message for the user.
+fn run(cli: &Cli) -> Result<i32, String> {
+    match &cli.command {
+        Command::Version => {
+            println!("sm {VERSION} — a Rust reimplementation of abduco");
+            Ok(0)
+        }
+        Command::List => list(),
+        Command::Rename { from, to } => rename(from, to, cli.quiet),
+        Command::Session(args) => session(args, cli.quiet),
     }
+}
 
-    let name = match &opts.name {
-        Some(n) => n.clone(),
-        None => {
-            eprintln!("sm: a session name is required");
-            usage();
-            return 1;
-        }
-    };
+fn session(args: &SessionArgs, quiet: bool) -> Result<i32, String> {
+    let name = &args.name;
+    let dir = socket_dir()?;
+    let path = sockdir::socket_path(&dir, name).map_err(|e| e.to_string())?;
 
-    // No explicit action but a name was given => attach-or-create (friendly default).
-    let action = opts.action.unwrap_or(Action::AttachOrCreate);
-
-    let dir = match sockdir::resolve_socket_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("sm: cannot prepare socket directory: {e}");
-            return 1;
-        }
-    };
-    let path = match sockdir::socket_path(&dir, &name) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("sm: {e}");
-            return 1;
-        }
-    };
-
-    let alive = sockdir::session_alive(&path);
-
-    match action {
-        Action::Attach => {
-            if !alive {
-                eprintln!("sm: no such session: {name}");
-                return 1;
+    match args.action {
+        Action::Attach => attach(&path, name, &args.attach, quiet),
+        Action::AttachOrCreate => match client::probe(&path) {
+            Liveness::Alive { .. } => attach(&path, name, &args.attach, quiet),
+            Liveness::Unresponsive(e) => Err(not_responding(name, &e)),
+            Liveness::Dead => {
+                // Nothing is listening, so any socket file there is stale.
+                remove_stale_socket(&path)?;
+                create(args, &path, quiet)
             }
-            attach(&opts, &path)
-        }
-        Action::Rename => rename(&opts, &name, &path, &dir, alive),
-        Action::AttachOrCreate => {
-            if alive {
-                attach(&opts, &path)
-            } else {
-                // Stale socket (if any) is safe to clear for attach-or-create.
-                let _ = std::fs::remove_file(&path);
-                create(&opts, &name, &path, true)
-            }
-        }
-        Action::Create | Action::CreateNoAttach => {
-            if alive {
-                eprintln!("sm: session already exists: {name}");
-                return 1;
-            }
-            if path.exists() {
-                // A leftover socket from a dead server.
-                if !opts.force {
-                    eprintln!("sm: stale session '{name}' exists; use -f to replace it");
-                    return 1;
+        },
+        Action::Create | Action::CreateDetached => match client::probe(&path) {
+            Liveness::Alive { .. } => Err(format!("session already exists: {name}")),
+            Liveness::Unresponsive(e) => Err(not_responding(name, &e)),
+            Liveness::Dead => {
+                if path.symlink_metadata().is_ok() {
+                    if !args.force {
+                        return Err(format!(
+                            "stale session '{name}' exists; use -f to replace it"
+                        ));
+                    }
+                    remove_stale_socket(&path)?;
                 }
-                let _ = std::fs::remove_file(&path);
+                create(args, &path, quiet)
             }
-            create(&opts, &name, &path, action == Action::Create)
-        }
+        },
     }
 }
 
-fn attach(opts: &Options, path: &Path) -> i32 {
-    let cfg = ClientConfig {
-        socket_path: path,
-        readonly: opts.readonly,
-        lowpriority: opts.lowpriority,
-        prefix_key: opts.prefix_key,
-        passthrough: opts.passthrough,
-    };
-    match client::attach(cfg) {
+fn attach(path: &Path, name: &str, opts: &AttachOptions, quiet: bool) -> Result<i32, String> {
+    let conn = Connection::open(path).map_err(|e| {
+        if client::is_absent(&e) {
+            format!("no such session: {name}")
+        } else {
+            format!("cannot attach to '{name}': {e}")
+        }
+    })?;
+    run_attached(conn, opts, quiet)
+}
+
+fn run_attached(conn: Connection, opts: &AttachOptions, quiet: bool) -> Result<i32, String> {
+    match conn.attach(opts) {
         Ok(Outcome::Detached) => {
-            if !opts.quiet {
+            if !quiet {
                 eprintln!("sm: detached");
             }
-            0
+            Ok(0)
         }
-        Ok(Outcome::Exited(status)) => status,
-        Ok(Outcome::ServerGone) => {
-            eprintln!("sm: session ended unexpectedly");
-            1
-        }
-        Err(e) => {
-            eprintln!("sm: attach failed: {e}");
-            1
-        }
+        Ok(Outcome::Exited(status)) => Ok(status),
+        Err(e) => Err(format!("attach failed: {e}")),
     }
 }
 
-/// Rename an existing session: `sm -R oldname newname`. `name`/`path` refer to
-/// the existing session; the new name comes from the first command-slot arg.
-fn rename(opts: &Options, name: &str, path: &Path, dir: &Path, alive: bool) -> i32 {
-    if !alive {
-        eprintln!("sm: no such session: {name}");
-        return 1;
-    }
-    let new_name = match opts.command.first() {
-        Some(n) => n.clone(),
-        None => {
-            eprintln!("sm: rename requires a new name (sm -R {name} <newname>)");
-            return 1;
-        }
-    };
-    let new_path = match sockdir::socket_path(dir, &new_name) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("sm: {e}");
-            return 1;
-        }
-    };
-    if new_name == name {
-        return 0; // no-op
-    }
-    if sockdir::session_alive(&new_path) {
-        eprintln!("sm: a session named '{new_name}' already exists");
-        return 1;
-    }
-    // Clear any stale socket at the target so the rename lands cleanly and its
-    // appearance is a reliable success signal.
-    let _ = std::fs::remove_file(&new_path);
+/// Rename an existing session: `sm -R oldname newname`.
+fn rename(from: &str, to: &str, quiet: bool) -> Result<i32, String> {
+    let dir = socket_dir()?;
+    let path = sockdir::socket_path(&dir, from).map_err(|e| e.to_string())?;
+    let new_path = sockdir::socket_path(&dir, to).map_err(|e| e.to_string())?;
 
-    match client::rename(path, &new_path, &new_name) {
-        Ok(()) => {
-            if !opts.quiet {
-                eprintln!("sm: renamed '{name}' -> '{new_name}'");
-            }
-            0
-        }
-        Err(e) => {
-            eprintln!("sm: rename failed: {e}");
-            1
-        }
+    let conn = match Connection::open(&path) {
+        Ok(conn) => conn,
+        Err(e) if client::is_absent(&e) => return Err(format!("no such session: {from}")),
+        Err(e) => return Err(not_responding(from, &e)),
+    };
+    if from == to {
+        return Ok(0);
     }
+    match client::probe(&new_path) {
+        Liveness::Alive { .. } => return Err(format!("a session named '{to}' already exists")),
+        Liveness::Unresponsive(e) => return Err(not_responding(to, &e)),
+        // Clear a stale socket so the name is free; the server's rename still
+        // refuses to replace anything that appears there in the meantime.
+        Liveness::Dead => remove_stale_socket(&new_path)?,
+    }
+
+    conn.rename(to).map_err(|e| format!("rename failed: {e}"))?;
+    if !quiet {
+        eprintln!("sm: renamed '{from}' -> '{to}'");
+    }
+    Ok(0)
 }
 
 /// Build the command vector: explicit CLI args, else $SM_CMD, else $SHELL, else /bin/sh.
-fn resolve_command(opts: &Options) -> Vec<String> {
-    if !opts.command.is_empty() {
-        return opts.command.clone();
+fn resolve_command(args: &[String]) -> Vec<String> {
+    if !args.is_empty() {
+        return args.to_vec();
     }
-    if let Ok(cmd) = std::env::var("SM_CMD")
-        && !cmd.is_empty()
-    {
-        return vec![cmd];
-    }
-    if let Ok(shell) = std::env::var("SHELL")
-        && !shell.is_empty()
-    {
-        return vec![shell];
-    }
-    vec!["/bin/sh".to_string()]
+    ["SM_CMD", "SHELL"]
+        .into_iter()
+        .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()))
+        .map_or_else(|| vec!["/bin/sh".to_string()], |cmd| vec![cmd])
 }
 
-/// Create the session (daemonize + spawn the server) and, if `do_attach`,
+/// Create the session (daemonize + spawn the server) and, unless asked not to,
 /// attach to it afterward. Returns the process exit code.
-fn create(opts: &Options, name: &str, path: &Path, do_attach: bool) -> i32 {
-    let command = resolve_command(opts);
-    let argv: Result<Vec<CString>, _> = command.iter().map(|s| CString::new(s.as_str())).collect();
-    let argv = match argv {
-        Ok(v) if !v.is_empty() => v,
-        _ => {
-            eprintln!("sm: invalid command");
-            return 1;
-        }
+fn create(args: &SessionArgs, path: &Path, quiet: bool) -> Result<i32, String> {
+    let argv = resolve_command(&args.command)
+        .into_iter()
+        .map(CString::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "invalid command: arguments must not contain NUL bytes".to_string())?;
+
+    // To attach, connect before the command starts rather than through the
+    // socket afterwards, which a short-lived command could already have left.
+    let (ours, creator) = if args.action == Action::CreateDetached {
+        (None, None)
+    } else {
+        let (ours, theirs) =
+            UnixStream::pair().map_err(|e| format!("cannot create connection: {e}"))?;
+        (Some(ours), Some(theirs))
     };
 
-    // Capture the current terminal size and modes so the pty starts matching.
-    let winsize = pty::get_winsize(libc::STDIN_FILENO);
-    let termios = client::current_termios();
-    // Run the command in the directory we were invoked from (the daemon itself
-    // chdirs to "/", so we pass this through for the command to restore).
-    let workdir = std::env::current_dir().ok();
-
-    let server_cfg = ServerConfig {
+    server::spawn(ServerConfig {
         socket_path: path.to_path_buf(),
-        session_name: name.to_string(),
+        session_name: args.name.clone(),
         argv,
-        winsize,
-        termios,
-        workdir,
+        // Start the pty matching the current terminal's size and modes.
+        winsize: pty::get_winsize(libc::STDIN_FILENO),
+        termios: term::current_termios(),
+        workdir: std::env::current_dir().ok(),
+        creator,
+    })?;
+
+    let Some(ours) = ours else {
+        if !quiet {
+            eprintln!("sm: session '{}' started", args.name);
+        }
+        return Ok(0);
     };
-
-    // Error-reporting pipe: the exec'd command's write end is CLOEXEC, so a
-    // successful exec closes it (we read EOF => success); a failed exec writes a
-    // message we relay to the user.
-    let (err_read, err_write) = match nix::unistd::pipe() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("sm: pipe failed: {e}");
-            return 1;
-        }
-    };
-    set_cloexec(&err_write);
-
-    match unsafe { fork() } {
-        Ok(ForkResult::Child) => {
-            // Intermediate process: become a session leader, then fork the real
-            // daemon so it can never re-acquire a controlling terminal.
-            drop(err_read);
-            let _ = setsid();
-            match unsafe { fork() } {
-                Ok(ForkResult::Child) => {
-                    let _ = chdir("/");
-                    server::run_server(server_cfg, err_write); // never returns
-                }
-                _ => exit(0), // intermediate parent exits immediately
-            }
-        }
-        Ok(ForkResult::Parent { child }) => {
-            drop(err_write);
-            // Reap the short-lived intermediate child.
-            let _ = waitpid(child, None);
-
-            // Block until the server either execs the command (EOF) or reports
-            // a startup error (message bytes).
-            let mut msg = String::new();
-            let mut reader = std::fs::File::from(err_read);
-            let _ = reader.read_to_string(&mut msg);
-            if !msg.is_empty() {
-                eprintln!("sm: {msg}");
-                return 1;
-            }
-
-            if do_attach {
-                attach(opts, path)
-            } else {
-                if !opts.quiet {
-                    eprintln!("sm: session '{name}' started");
-                }
-                0
-            }
-        }
-        Err(e) => {
-            eprintln!("sm: fork failed: {e}");
-            1
-        }
-    }
+    let conn = Connection::establish(ours).map_err(|e| format!("attach failed: {e}"))?;
+    run_attached(conn, &args.attach, quiet)
 }
 
-fn do_list() -> i32 {
-    let dir = match sockdir::resolve_socket_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("sm: cannot access socket directory: {e}");
-            return 1;
-        }
-    };
-    let sessions = match sockdir::list_sessions(&dir) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("sm: cannot list sessions: {e}");
-            return 1;
-        }
-    };
+fn list() -> Result<i32, String> {
+    let dir = socket_dir()?;
+    let sessions =
+        sockdir::list_sessions(&dir).map_err(|e| format!("cannot list sessions: {e}"))?;
     if sessions.is_empty() {
         eprintln!("sm: no sessions");
-        return 0;
+        return Ok(0);
     }
     for s in sessions {
-        let pid = s.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+        // `*` attached, `-` detached, `?` stale or not responding.
+        let (status, pid) = match client::probe(&s.path) {
+            Liveness::Alive { pid } => (if s.attached { '*' } else { '-' }, pid.to_string()),
+            Liveness::Unresponsive(_) | Liveness::Dead => ('?', "-".to_string()),
+        };
         let when = s.mtime.map(format_time).unwrap_or_default();
-        println!("{}  {:<20} {:>8}  {}", s.status, s.name, pid, when);
+        println!("{status}  {:<20} {pid:>8}  {when}", s.name);
     }
-    0
+    Ok(0)
 }
 
-fn format_time(t: std::time::SystemTime) -> String {
-    let secs = t
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as libc::time_t)
-        .unwrap_or(0);
+fn socket_dir() -> Result<std::path::PathBuf, String> {
+    sockdir::resolve_socket_dir().map_err(|e| format!("cannot prepare socket directory: {e}"))
+}
+
+fn remove_stale_socket(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "cannot remove stale socket {}: {e}",
+            path.display()
+        )),
+    }
+}
+
+fn not_responding(name: &str, err: &io::Error) -> String {
+    format!("session '{name}' exists but is not responding: {err}")
+}
+
+fn format_time(t: SystemTime) -> String {
+    let secs = t.duration_since(UNIX_EPOCH).map_or(0, |d| {
+        libc::time_t::try_from(d.as_secs()).unwrap_or(libc::time_t::MAX)
+    });
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe { libc::localtime_r(&secs, &mut tm) };
+    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+        return String::new();
+    }
     let mut buf = [0u8; 64];
-    let fmt = CString::new("%Y-%m-%d %H:%M:%S").unwrap();
-    let n = unsafe { libc::strftime(buf.as_mut_ptr().cast(), buf.len(), fmt.as_ptr(), &tm) };
-    String::from_utf8_lossy(&buf[..n]).into_owned()
-}
-
-fn set_cloexec(fd: &OwnedFd) {
-    unsafe {
-        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD);
-        if flags != -1 {
-            libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC);
-        }
-    }
-}
-
-// ---- argument parsing -------------------------------------------------------
-
-fn parse_args() -> Result<Options, String> {
-    let mut opts = Options {
-        action: None,
-        list: false,
-        force: false,
-        readonly: false,
-        lowpriority: false,
-        passthrough: false,
-        quiet: false,
-        prefix_key: DEFAULT_PREFIX_KEY,
-        name: None,
-        command: Vec::new(),
+    let n = unsafe {
+        libc::strftime(
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            c"%Y-%m-%d %H:%M:%S".as_ptr(),
+            &tm,
+        )
     };
-
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut i = 0;
-    let mut positional_started = false;
-
-    while i < args.len() {
-        let tok = &args[i];
-        // Once the first positional (the name) is seen, everything else is the
-        // command line verbatim — including tokens that start with '-'.
-        if positional_started {
-            opts.command.push(tok.clone());
-            i += 1;
-            continue;
-        }
-        if tok == "--" {
-            positional_started = true;
-            i += 1;
-            continue;
-        }
-        if tok.len() >= 2 && tok.starts_with('-') {
-            let chars: Vec<char> = tok[1..].chars().collect();
-            let mut j = 0;
-            while j < chars.len() {
-                match chars[j] {
-                    'a' => set_action(&mut opts, Action::Attach)?,
-                    'A' => set_action(&mut opts, Action::AttachOrCreate)?,
-                    'c' => set_action(&mut opts, Action::Create)?,
-                    'n' => set_action(&mut opts, Action::CreateNoAttach)?,
-                    'R' => set_action(&mut opts, Action::Rename)?,
-                    'f' => opts.force = true,
-                    'l' => opts.list = true,
-                    'L' => opts.lowpriority = true,
-                    'p' => opts.passthrough = true,
-                    'q' => opts.quiet = true,
-                    'r' => opts.readonly = true,
-                    'v' => {
-                        println!("sm {VERSION} — a Rust reimplementation of abduco");
-                        exit(0);
-                    }
-                    'e' => {
-                        // Value is the rest of this token, or the next argument.
-                        let rest: String = chars[j + 1..].iter().collect();
-                        let spec = if !rest.is_empty() {
-                            rest
-                        } else {
-                            i += 1;
-                            args.get(i)
-                                .cloned()
-                                .ok_or_else(|| "-e requires a key argument".to_string())?
-                        };
-                        opts.prefix_key = parse_detach_key(&spec)?;
-                        break; // consumed the remainder of this token
-                    }
-                    other => return Err(format!("unknown option -{other}")),
-                }
-                j += 1;
-            }
-        } else {
-            // First positional = session name; the remainder is the command.
-            opts.name = Some(tok.clone());
-            positional_started = true;
-        }
-        i += 1;
-    }
-
-    Ok(opts)
-}
-
-fn set_action(opts: &mut Options, action: Action) -> Result<(), String> {
-    if opts.action.is_some() {
-        return Err("only one of -a/-A/-c/-n may be given".to_string());
-    }
-    opts.action = Some(action);
-    Ok(())
-}
-
-/// Parse a detach-key spec: `^x` (Ctrl-x), a single character, or a decimal
-/// byte value.
-fn parse_detach_key(spec: &str) -> Result<u8, String> {
-    let chars: Vec<char> = spec.chars().collect();
-    if chars.len() == 2 && chars[0] == '^' {
-        let c = chars[1].to_ascii_uppercase() as u32;
-        return Ok((c & 0x1f) as u8);
-    }
-    if chars.len() == 1 {
-        let c = chars[0] as u32;
-        if c < 128 {
-            return Ok(c as u8);
-        }
-    }
-    if let Ok(n) = spec.parse::<u8>() {
-        return Ok(n);
-    }
-    Err(format!("invalid detach key: {spec}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn detach_key_ctrl_backslash() {
-        assert_eq!(parse_detach_key("^\\").unwrap(), 0x1c);
-    }
-
-    #[test]
-    fn detach_key_ctrl_o() {
-        assert_eq!(parse_detach_key("^o").unwrap(), 0x0f);
-        assert_eq!(parse_detach_key("^O").unwrap(), 0x0f);
-    }
-
-    #[test]
-    fn detach_key_single_char() {
-        assert_eq!(parse_detach_key("q").unwrap(), b'q');
-    }
-
-    #[test]
-    fn detach_key_decimal() {
-        assert_eq!(parse_detach_key("28").unwrap(), 28);
-    }
-
-    #[test]
-    fn detach_key_invalid() {
-        assert!(parse_detach_key("abc").is_err());
-    }
+    String::from_utf8_lossy(&buf[..n]).into_owned()
 }

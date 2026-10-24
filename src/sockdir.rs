@@ -1,28 +1,23 @@
-//! Socket-directory resolution and the security model around it, plus session
-//! listing and liveness probing.
+//! Socket-directory resolution and the security model around it, session-name
+//! validation, and enumeration of the session sockets in a directory.
 //!
 //! Session state is encoded in the socket file's permission bits (an attached
-//! session gets the owner-execute bit set), so `list_sessions` can read status
-//! from `stat(2)` alone without connecting. Liveness (is the server still
-//! there?) is confirmed by connecting and reading the server's `Pid` packet.
+//! session gets the owner-execute bit set), so listing can read status from
+//! `stat(2)` alone. Whether a server is actually alive behind a socket is a
+//! protocol question, answered by `client::probe`.
 
-use std::ffi::CString;
-use std::fs;
+use std::fs::{self, DirBuilder, Metadata};
 use std::io::{self, ErrorKind};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
-use crate::protocol::Packet;
+use nix::unistd::{Uid, User};
 
 /// Application directory name used inside shared/base directories.
 const APP: &str = "sm";
 /// Personal directory name created under $HOME.
 const HOME_DIR: &str = ".session_manager";
-
-/// macOS/BSD `sun_path` holds 104 bytes including the NUL terminator.
-const SUN_PATH_MAX: usize = 103;
 
 // Owner-execute bit toggled to mark a session as "attached".
 const ATTACHED_BIT: u32 = 0o100;
@@ -33,51 +28,60 @@ const BASE_MODE: u32 = 0o600;
 /// `$TMPDIR/sm/$USER`, `/tmp/sm/$USER` — returning the first that can be created
 /// and verified as owned by us with no group/other access.
 pub fn resolve_socket_dir() -> io::Result<PathBuf> {
-    let mut last_err: Option<io::Error> = None;
-    let user = username();
+    let mut last_err = None;
 
-    // (candidate personal dir, is it created directly vs. via a shared parent)
-    let mut candidates: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
-
-    if let Some(dir) = env_nonempty("SM_SOCKET_DIR") {
-        candidates.push((PathBuf::from(dir), None));
-    }
-    if let Some(home) = env_nonempty("HOME") {
-        candidates.push((Path::new(&home).join(HOME_DIR), None));
-    }
-    if let Some(tmp) = env_nonempty("TMPDIR") {
-        let base = Path::new(&tmp).join(APP);
-        candidates.push((base.join(&user), Some(base)));
-    }
-    {
-        let base = PathBuf::from("/tmp").join(APP);
-        candidates.push((base.join(&user), Some(base)));
-    }
-
-    for (dir, shared_parent) in candidates {
-        match ensure_dir(&dir, shared_parent.as_deref()) {
+    // Directories the user chose (or owns the parent of) directly.
+    let personal = [
+        env_nonempty("SM_SOCKET_DIR").map(PathBuf::from),
+        env_nonempty("HOME").map(|home| Path::new(&home).join(HOME_DIR)),
+    ];
+    for dir in personal.into_iter().flatten() {
+        match ensure_private_dir(&dir) {
             Ok(()) => return Ok(dir),
             Err(e) => last_err = Some(e),
         }
     }
+
+    // A per-user directory beneath a shared, world-writable base.
+    let user = username();
+    let shared_bases = [
+        env_nonempty("TMPDIR").map(|tmp| Path::new(&tmp).join(APP)),
+        Some(Path::new("/tmp").join(APP)),
+    ];
+    for base in shared_bases.into_iter().flatten() {
+        let dir = base.join(&user);
+        match ensure_dir_in_shared_base(&base, &dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) => last_err = Some(e),
+        }
+    }
+
     Err(last_err.unwrap_or_else(|| io::Error::other("no usable socket directory")))
+}
+
+/// Check that `name` can be used as a session name: a single, ordinary path
+/// component.
+pub fn validate_name(name: &str) -> io::Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid session name: {name:?}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Full path of the socket for `name` inside `dir`, validating the session name
 /// and the resulting path length (Unix socket paths are tightly bounded).
 pub fn socket_path(dir: &Path, name: &str) -> io::Result<PathBuf> {
-    if name.is_empty() || name.contains('/') || name.contains('\0') {
-        return Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            "invalid session name",
-        ));
-    }
+    validate_name(name)?;
     let path = dir.join(name);
-    if path.as_os_str().len() > SUN_PATH_MAX {
+    let max = max_socket_path_len();
+    if path.as_os_str().len() > max {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
             format!(
-                "socket path too long ({} > {SUN_PATH_MAX}); set SM_SOCKET_DIR to a shorter path",
+                "socket path too long ({} > {max}); set SM_SOCKET_DIR to a shorter path",
                 path.as_os_str().len()
             ),
         ));
@@ -95,145 +99,151 @@ pub fn set_socket_state(path: &Path, attached: bool) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
 }
 
-/// One entry in the session listing.
-pub struct SessionInfo {
+/// One session socket found in the socket directory.
+pub struct SessionEntry {
     pub name: String,
-    /// `*` attached, `-` detached, `?` stale/unresponsive.
-    pub status: char,
+    pub path: PathBuf,
+    /// Whether the server last marked the session as having a client attached.
+    pub attached: bool,
     pub mtime: Option<SystemTime>,
-    pub pid: Option<u32>,
 }
 
-/// Enumerate sessions in `dir`, deriving attached/detached from the socket mode
-/// and liveness from a connect+Pid probe.
-pub fn list_sessions(dir: &Path) -> io::Result<Vec<SessionInfo>> {
-    let mut out = Vec::new();
+/// Enumerate the session sockets in `dir`, sorted by name. This only reads the
+/// file system; liveness is the caller's concern.
+pub fn list_sessions(dir: &Path) -> io::Result<Vec<SessionEntry>> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(out),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let meta = match fs::metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if !meta.file_type().is_socket() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let mode = meta.permissions().mode();
-        let pid = probe(&path);
-        let status = if pid.is_none() {
-            '?'
-        } else if mode & ATTACHED_BIT != 0 {
-            '*'
-        } else {
-            '-'
-        };
-        out.push(SessionInfo {
-            name,
-            status,
-            mtime: meta.modified().ok(),
-            pid,
-        });
-    }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(out)
-}
-
-/// True if a live server answers on this socket.
-pub fn session_alive(path: &Path) -> bool {
-    probe(path).is_some()
-}
-
-/// Connect to the socket and read the server's `Pid` packet, returning the pid
-/// if the server is alive and responsive. Short timeouts keep listing snappy
-/// even against a wedged socket.
-fn probe(path: &Path) -> Option<u32> {
-    let mut stream = UnixStream::connect(path).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_millis(250)))
-        .ok()?;
-    match Packet::read_from(&mut stream) {
-        Ok(Packet::Pid(pid)) => Some(pid),
-        _ => None,
-    }
+    let mut sessions: Vec<SessionEntry> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let meta = fs::metadata(&path).ok()?;
+            meta.file_type().is_socket().then(|| SessionEntry {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                attached: meta.permissions().mode() & ATTACHED_BIT != 0,
+                mtime: meta.modified().ok(),
+                path,
+            })
+        })
+        .collect();
+    sessions.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(sessions)
 }
 
 // ---- internal helpers -------------------------------------------------------
+
+/// Longest socket path the platform accepts (`sun_path` minus its NUL).
+fn max_socket_path_len() -> usize {
+    // SAFETY: sockaddr_un is plain old data; all-zeroes is a valid value.
+    let addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_path.len() - 1
+}
 
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
+/// The current user's login name from the password database, falling back to
+/// the numeric uid. Unlike `$USER`, this can't disagree with the uid that the
+/// directory ownership checks compare against.
 fn username() -> String {
-    if let Some(u) = env_nonempty("USER") {
-        return u;
+    let uid = Uid::current();
+    match User::from_uid(uid) {
+        Ok(Some(user)) => user.name,
+        _ => uid.to_string(),
     }
-    // Fall back to the numeric uid if $USER is unset.
-    format!("{}", unsafe { libc::getuid() })
 }
 
-/// Ensure `dir` exists as a 0700 directory owned by us. If `shared_parent` is
-/// given, first create that parent world-writable + sticky (like `/tmp`) so
-/// multiple users can each own a private subdirectory beneath it.
-fn ensure_dir(dir: &Path, shared_parent: Option<&Path>) -> io::Result<()> {
-    let prev_umask = unsafe { libc::umask(0) };
-    let result = (|| {
-        if let Some(parent) = shared_parent {
-            // 0777 | sticky; ignore EEXIST.
-            mkdir(parent, 0o1777)?;
-        }
-        mkdir(dir, 0o700)?;
-        verify_owned_private(dir)
-    })();
-    unsafe { libc::umask(prev_umask) };
-    result
+/// Ensure `dir` exists as a directory owned by us with no group/other access.
+/// The path may be a symlink: the location was chosen by the user.
+fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    create_dir_with_mode(dir, 0o700)?;
+    verify_private(dir, &fs::metadata(dir)?)
 }
 
-/// mkdir(path, mode); treats an existing directory as success.
-fn mkdir(path: &Path, mode: libc::mode_t) -> io::Result<()> {
-    let c = cpath(path)?;
-    let rc = unsafe { libc::mkdir(c.as_ptr(), mode) };
-    if rc == 0 {
-        return Ok(());
+/// Ensure `dir`, a per-user directory inside the shared `base` (like
+/// `/tmp/sm`), exists and is private to us. The base is created world-writable
+/// and sticky so several users can each own a subdirectory, and is verified to
+/// be safe to build on; `dir` itself must be a real directory, not a symlink
+/// someone else planted under our name.
+fn ensure_dir_in_shared_base(base: &Path, dir: &Path) -> io::Result<()> {
+    create_dir_with_mode(base, 0o1777)?;
+    verify_shared_base(base, &fs::symlink_metadata(base)?)?;
+    create_dir_with_mode(dir, 0o700)?;
+    verify_private(dir, &fs::symlink_metadata(dir)?)
+}
+
+/// Create a directory with exactly `mode` (the umask notwithstanding). An
+/// existing entry is left untouched for the caller to verify.
+fn create_dir_with_mode(path: &Path, mode: u32) -> io::Result<()> {
+    match DirBuilder::new().mode(mode).create(path) {
+        Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(mode)),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
     }
-    let err = io::Error::last_os_error();
-    if err.kind() == ErrorKind::AlreadyExists {
-        return Ok(());
-    }
-    Err(err)
 }
 
 /// Reject a directory unless it is owned by the current uid and has no group or
 /// other access — this is what stops another user from planting a directory (or
 /// socket) we'd otherwise trust and connect to.
-fn verify_owned_private(path: &Path) -> io::Result<()> {
-    let c = cpath(path)?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::stat(c.as_ptr(), &mut st) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
+fn verify_private(path: &Path, meta: &Metadata) -> io::Result<()> {
+    if !meta.is_dir() {
+        return Err(insecure(path, "is not a directory"));
     }
-    if st.st_uid != unsafe { libc::getuid() } {
-        return Err(io::Error::new(
-            ErrorKind::PermissionDenied,
-            format!("{} is not owned by the current user", path.display()),
-        ));
+    if meta.uid() != Uid::current().as_raw() {
+        return Err(insecure(path, "is not owned by the current user"));
     }
-    if st.st_mode & 0o077 != 0 {
-        return Err(io::Error::new(
-            ErrorKind::PermissionDenied,
-            format!("{} is accessible by group/other", path.display()),
-        ));
+    if meta.mode() & 0o077 != 0 {
+        return Err(insecure(path, "is accessible by group/other"));
     }
     Ok(())
 }
 
-fn cpath(path: &Path) -> io::Result<CString> {
-    use std::os::unix::ffi::OsStrExt;
-    CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "path contains NUL"))
+/// Reject a shared base directory that would let another user rename or
+/// replace our private directory inside it: it must be a real directory owned
+/// by root or us, and sticky if others can write to it.
+fn verify_shared_base(path: &Path, meta: &Metadata) -> io::Result<()> {
+    if !meta.is_dir() {
+        return Err(insecure(path, "is not a directory"));
+    }
+    if meta.uid() != 0 && meta.uid() != Uid::current().as_raw() {
+        return Err(insecure(path, "is owned by another user"));
+    }
+    if meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
+        return Err(insecure(path, "is writable by others but not sticky"));
+    }
+    Ok(())
+}
+
+fn insecure(path: &Path, problem: &str) -> io::Error {
+    io::Error::new(
+        ErrorKind::PermissionDenied,
+        format!("{} {problem}", path.display()),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_names() {
+        for ok in ["work", "a.b", ".hidden", "with space", "ümlaut"] {
+            assert!(validate_name(ok).is_ok(), "{ok:?} should be valid");
+        }
+        for bad in ["", ".", "..", "a/b", "/abs", "nul\0byte"] {
+            assert!(validate_name(bad).is_err(), "{bad:?} should be invalid");
+        }
+    }
+
+    #[test]
+    fn socket_path_length_is_bounded() {
+        let dir = Path::new("/tmp");
+        assert!(socket_path(dir, "short").is_ok());
+        let long = "x".repeat(max_socket_path_len());
+        assert!(socket_path(dir, &long).is_err());
+    }
 }
