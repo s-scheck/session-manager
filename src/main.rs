@@ -14,13 +14,13 @@ mod term;
 
 use std::ffi::CString;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::exit;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cli::{Action, Cli, Command, SessionArgs};
+use cli::{Action, Cli, Command, ListFormat, SessionArgs};
 use client::{AttachOptions, Connection, Liveness, Outcome};
 use server::ServerConfig;
 
@@ -50,7 +50,7 @@ fn run(cli: &Cli) -> Result<i32, String> {
             println!("sm {VERSION} — a Rust reimplementation of abduco");
             Ok(0)
         }
-        Command::List => list(),
+        Command::List(format) => list(*format),
         Command::Kill { name } => kill(name, cli.quiet),
         Command::Rename { from, to } => rename(from, to, cli.quiet),
         Command::Session(args) => session(args, cli.quiet),
@@ -203,23 +203,32 @@ fn create(args: &SessionArgs, path: &Path, quiet: bool) -> Result<i32, String> {
     run_attached(conn, &args.attach, quiet)
 }
 
-fn list() -> Result<i32, String> {
+fn list(format: ListFormat) -> Result<i32, String> {
     let dir = socket_dir()?;
     let sessions =
         sockdir::list_sessions(&dir).map_err(|e| format!("cannot list sessions: {e}"))?;
-    if sessions.is_empty() {
+    if sessions.is_empty() && format == ListFormat::Table {
         eprintln!("sm: no sessions");
         return Ok(0);
     }
+    let mut out = io::stdout().lock();
     for s in sessions {
         // `*` attached, `-` detached, `?` stale or not responding.
         let (status, pid) = match client::probe(&s.path) {
             Liveness::Alive { pid } => (if s.attached { '*' } else { '-' }, pid.to_string()),
             Liveness::Unresponsive(_) | Liveness::Dead => ('?', "-".to_string()),
         };
-        let when = s.mtime.map(format_time).unwrap_or_default();
-        println!("{status}  {:<20} {pid:>8}  {when}", s.name);
+        let written = match format {
+            ListFormat::Table => {
+                let when = s.mtime.map(format_time).unwrap_or_default();
+                writeln!(out, "{status}  {:<20} {pid:>8}  {when}", s.name)
+            }
+            ListFormat::NulTerminated => write!(out, "{status} {}\0", s.name),
+        };
+        written.map_err(|e| format!("cannot write session list: {e}"))?;
     }
+    out.flush()
+        .map_err(|e| format!("cannot write session list: {e}"))?;
     Ok(0)
 }
 

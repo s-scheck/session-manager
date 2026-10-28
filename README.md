@@ -27,7 +27,7 @@ on `nix` and `libc`.
 sm [-a|-A|-c|-n] [-d] [-p] [-r] [-q] [-L] [-f] [-e prefixkey] name [command ...]
 sm -k name     # kill a session
 sm -R old new  # rename a session
-sm -l          # list sessions
+sm -l [-z]     # list sessions
 sm -v          # version
 ```
 
@@ -53,6 +53,7 @@ sm -v          # version
 | `-q` | quiet: suppress informational messages |
 | `-f` | force: replace a **dead** session's stale socket (refuses if still alive) |
 | `-l` | list sessions |
+| `-z` | with `-l`: print one `<status> <name>` record per session, each terminated by a NUL byte, for scripts and shell completion |
 
 If no command is given, `sm` runs `$SM_CMD`, else `$SHELL`, else `/bin/sh`.
 
@@ -111,6 +112,26 @@ detaches, control passes to the next one.
 treated as stale when nothing listens on it at all. A session that does not
 answer (or was started by an incompatible `sm` version — e.g. after an upgrade)
 shows as `?` in the listing and is left alone.
+
+## Shell completion (zsh)
+
+`completions/_sm` completes options, the names of running sessions (`sm -a`,
+`sm -da`, `sm -k`, `sm -R`, or a bare `sm`, each shown as attached or
+detached) and, after the name of a session to create, the command and its
+arguments. Put it in a directory on your `$fpath`, e.g. with oh-my-zsh:
+
+```sh
+mkdir -p ~/.oh-my-zsh/custom/completions
+cp completions/_sm ~/.oh-my-zsh/custom/completions/
+exec zsh
+```
+
+Without a framework, copy it to e.g. `~/.zsh/completions` and add
+`fpath=(~/.zsh/completions $fpath)` before `compinit` in `~/.zshrc`. If it
+does not take effect, remove the cached `~/.zcompdump*` and start a new shell.
+
+Session names come from `sm -lz`, so every name completes correctly, even one
+with spaces or colons.
 
 ## Environment
 | Variable | Purpose |

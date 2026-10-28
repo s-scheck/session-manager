@@ -1,0 +1,78 @@
+#compdef sm
+
+# zsh completion for sm. Session names come from `sm -lz`, whose
+# NUL-terminated records carry any name intact.
+
+# Offer the sessions whose status is one of the given marks: `*` attached,
+# `-` detached, `?` stale or not responding.
+(( $+functions[_sm_sessions] )) ||
+_sm_sessions() {
+  local -a records sessions
+  local record mark desc
+  records=( ${(0)"$(_call_program sessions $_sm_command -lz 2>/dev/null)"} )
+  for record in $records; do
+    mark=$record[1]
+    (( $argv[(Ie)$mark] )) || continue
+    case $mark in
+      ('*') desc=attached ;;
+      (-) desc=detached ;;
+      (*) desc='not responding' ;;
+    esac
+    sessions+=( "${${record[3,-1]}//:/\\:}:$desc" )
+  done
+  _describe -t sessions session sessions
+}
+
+_sm() {
+  local curcontext=$curcontext state state_descr line ret=1
+  local -A opt_args
+  # The sm being completed, so that e.g. ./target/debug/sm lists its own sessions.
+  local _sm_command=$words[1]
+  local actions='-a -A -c -n -k -R'
+  local session_options='-d -e -f -L -p -r'
+
+  # One mode at a time: an action, the listing (-l, -z), or the version.
+  _arguments -s -S -C \
+    "($actions -l -z -v)-a[attach to an existing session]" \
+    "($actions -l -z -v)-A[attach, or create the session if absent]" \
+    "($actions -l -z -v)-c[create a session and attach]" \
+    "($actions -l -z -v)-n[create a session without attaching]" \
+    "($actions -l -z -v)-k[kill a session]" \
+    "($actions -l -z -v)-R[rename a session]" \
+    "(: $actions $session_options -v)-l[list sessions]" \
+    "(: $actions $session_options -v)-z[with -l: NUL-terminated records]" \
+    '(-l -z -v)-d[detach other clients when attaching]' \
+    '(-l -z -v)-e+[set the detach prefix key]:prefix key (e.g. ^b)' \
+    '(-l -z -v)-f[replace a dead session'\''s stale socket]' \
+    '(-l -z -v)-L[low priority: never control the window size]' \
+    '(-l -z -v)-p[passthrough: no raw mode or detach key]' \
+    '(-l -z -v)-r[read-only]' \
+    '(-v)-q[suppress informational messages]' \
+    '(- :)-v[print version]' \
+    '1: :->name' \
+    '*:: :->rest' && ret=0
+
+  case $state in
+    (name)
+      if (( $+opt_args[-c] || $+opt_args[-n] )); then
+        _message -e sessions 'new session name'
+      else
+        _sm_sessions '*' - && ret=0
+      fi
+      ;;
+    (rest)
+      # The words after the session name: the new name for -R, otherwise the
+      # command to run if the session gets created.
+      if (( $+opt_args[-R] )); then
+        (( CURRENT == 2 )) && _message -e sessions 'new session name'
+      elif (( ! $+opt_args[-a] && ! $+opt_args[-k] )); then
+        shift words
+        (( CURRENT-- ))
+        _normal && ret=0
+      fi
+      ;;
+  esac
+  return ret
+}
+
+_sm "$@"

@@ -9,7 +9,7 @@ pub const USAGE: &str = "\
 usage: sm [-a|-A|-c|-n] [-d] [-p] [-r] [-q] [-L] [-f] [-e prefixkey] name [command ...]
        sm -k name                kill a session
        sm -R oldname newname     rename a session
-       sm -l                     list sessions
+       sm -l [-z]                list sessions (-z: NUL-terminated records)
        sm -v                     print version
 
 detach: press the prefix key (default Ctrl-a) then 'd'. Press the prefix
@@ -27,7 +27,7 @@ pub struct Cli {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
-    List,
+    List(ListFormat),
     Version,
     Kill { name: String },
     Rename { from: String, to: String },
@@ -43,6 +43,16 @@ pub struct SessionArgs {
     /// Replace a dead session's stale socket.
     pub force: bool,
     pub attach: AttachOptions,
+}
+
+/// How `sm -l` prints the sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListFormat {
+    /// An aligned table for people.
+    Table,
+    /// -z: one `<status> <name>` record per session, each terminated by a NUL
+    /// byte, so that scripts and shell completion can read any name.
+    NulTerminated,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +79,7 @@ enum Mode {
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
     let mut mode = None;
     let mut list = false;
+    let mut nul_terminated = false;
     let mut force = false;
     let mut quiet = false;
     let mut attach = AttachOptions {
@@ -128,6 +139,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
                     attach.readonly = true;
                     continue;
                 }
+                'z' => {
+                    nul_terminated = true;
+                    continue;
+                }
                 'v' => {
                     return Ok(Cli {
                         command: Command::Version,
@@ -154,6 +169,11 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
         }
     }
 
+    let format = if nul_terminated {
+        ListFormat::NulTerminated
+    } else {
+        ListFormat::Table
+    };
     let command = match (list, mode) {
         (true, Some(_)) => {
             return Err("-l cannot be combined with -a/-A/-c/-n/-k/-R".to_string());
@@ -162,7 +182,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
             return Err("-l does not take a session name".to_string());
         }
         // A bare `sm` lists sessions too.
-        (_, None) if positionals.is_empty() => Command::List,
+        (_, None) if positionals.is_empty() => Command::List(format),
         (_, Some(Mode::Kill)) => match <[String; 1]>::try_from(positionals) {
             Ok([name]) => Command::Kill { name },
             Err(_) => return Err("kill takes exactly one name: sm -k name".to_string()),
@@ -177,6 +197,9 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
         // A name without an action: attach-or-create (friendly default).
         (_, None) => session(Action::AttachOrCreate, positionals, force, attach)?,
     };
+    if nul_terminated && !matches!(command, Command::List(_)) {
+        return Err("-z only applies to -l".to_string());
+    }
     Ok(Cli { command, quiet })
 }
 
@@ -270,11 +293,22 @@ mod tests {
 
     #[test]
     fn bare_invocation_lists() {
-        assert_eq!(parse_str("").unwrap().command, Command::List);
-        assert_eq!(parse_str("-l").unwrap().command, Command::List);
-        assert_eq!(parse_str("-q").unwrap().command, Command::List);
+        let table = Command::List(ListFormat::Table);
+        assert_eq!(parse_str("").unwrap().command, table);
+        assert_eq!(parse_str("-l").unwrap().command, table);
+        assert_eq!(parse_str("-q").unwrap().command, table);
         assert!(parse_str("-l work").is_err());
         assert!(parse_str("-l -c work").is_err());
+    }
+
+    #[test]
+    fn nul_terminated_listing_is_only_for_lists() {
+        let records = Command::List(ListFormat::NulTerminated);
+        assert_eq!(parse_str("-lz").unwrap().command, records);
+        assert_eq!(parse_str("-z -l").unwrap().command, records);
+        assert_eq!(parse_str("-z").unwrap().command, records);
+        assert!(parse_str("-z work").is_err());
+        assert!(parse_str("-z -k work").is_err());
     }
 
     #[test]

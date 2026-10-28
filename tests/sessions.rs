@@ -418,6 +418,26 @@ fn stale_sockets_need_force_or_attach_or_create() {
 }
 
 #[test]
+fn nul_terminated_listing_carries_any_name() {
+    let s = Sessions::new("records");
+    let out = s.run(&["-lz"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!((stdout(&out), stderr(&out)), (String::new(), String::new()));
+
+    s.create("alpha", "read x");
+    s.create("my: work", "read x");
+    drop(UnixListener::bind(s.socket("old")).unwrap());
+    let out = s.run(&["-lz"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "- alpha\0- my: work\0? old\0");
+
+    for name in ["alpha", "my: work"] {
+        let out = s.run(&["-k", "-q", name]);
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+}
+
+#[test]
 fn incompatible_server_is_reported_and_left_alone() {
     let s = Sessions::new("compat");
     // A pre-versioning server greeted with a bare 4-byte pid.
